@@ -1,0 +1,46 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build output
+build/bin/
+build/ffmpeg/
+build/*.zip
+frontend/dist/
+
+# Dependencies
+frontend/node_modules/
+frontend/wailsjs/
+frontend/package.json.md5
+
+# Runtime cache
+wt-magnet-cache/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
+
+.joycode/

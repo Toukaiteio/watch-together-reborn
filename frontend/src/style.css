@@ -1,0 +1,153 @@
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/inter/700.css';
+@import '@fontsource/cormorant-garamond/600.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-bg-base: #f3f3f1;
+  --color-bg-elevated: #ffffff;
+  --color-bg-sunken: #e8e8e5;
+  --color-fg: #121212;
+  --color-fg-muted: #636363;
+  --color-fg-subtle: #8e8e8e;
+  --color-fg-on-accent: #ffffff;
+  --color-line: #d6d6d1;
+  --color-line-strong: #b4b4ad;
+  --color-accent: #121212;
+  --color-accent-hover: #2a2a2a;
+  --color-danger-rgb: 185 68 68;
+  --color-danger-fg: #ffffff;
+  --font-display: 'Cormorant Garamond', 'Iowan Old Style', 'Palatino Linotype', serif;
+}
+
+.dark {
+  --color-bg-base: #090909;
+  --color-bg-elevated: #111111;
+  --color-bg-sunken: #0d0d0d;
+  --color-fg: #f2f2ee;
+  --color-fg-muted: #a0a0a0;
+  --color-fg-subtle: #676767;
+  --color-fg-on-accent: #090909;
+  --color-line: #242424;
+  --color-line-strong: #3a3a3a;
+  --color-accent: #f2f2ee;
+  --color-accent-hover: #d8d8d3;
+  --color-danger-rgb: 214 92 92;
+  --color-danger-fg: #ffffff;
+  --font-display: 'Cormorant Garamond', 'Iowan Old Style', 'Palatino Linotype', serif;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-line);
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv11', 'ss01';
+    background-color: var(--color-bg-base);
+    color: var(--color-fg);
+  }
+
+  #app {
+    height: 100%;
+    width: 100%;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fg-subtle);
+  }
+
+  input,
+  textarea,
+  button {
+    font-family: inherit;
+  }
+
+  input:focus,
+  textarea:focus {
+    outline: none;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium transition-fast rounded;
+    @apply bg-accent text-fg-onAccent hover:bg-accent-hover;
+    @apply disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium transition-fast rounded;
+    @apply text-fg hover:bg-bg-sunken;
+    @apply disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-outline {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium transition-fast rounded;
+    @apply border border-line-strong text-fg hover:bg-bg-sunken;
+    @apply disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .input {
+    @apply w-full px-3 py-2 text-sm bg-bg-sunken border border-line rounded;
+    @apply text-fg placeholder:text-fg-subtle;
+    @apply focus:border-line-strong;
+    @apply transition-fast;
+  }
+
+  .tab-active {
+    @apply text-fg border-b-2 border-accent;
+  }
+
+  .tab-inactive {
+    @apply text-fg-muted border-b-2 border-transparent hover:text-fg;
+  }
+}
+
+/* Gradient title */
+.title-gradient {
+  background: linear-gradient(135deg, var(--color-fg) 0%, var(--color-fg-muted) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* DPlayer theme overrides */
+.dplayer {
+  --dplayer-theme: var(--color-accent);
+}
+
+.dplayer-controller {
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.5)) !important;
+}
+
+.dplayer-comment-setting {
+  display: none !important;
+}

@@ -1,0 +1,31 @@
+{
+  "name": "watch-together-reborn-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource/cormorant-garamond": "^5.2.11",
+    "@fontsource/inter": "^5.1.1",
+    "dplayer": "^1.27.0",
+    "hls.js": "^1.5.18",
+    "lucide-vue-next": "^0.471.0",
+    "pinia": "^2.3.1",
+    "vue": "^3.5.13",
+    "wasmboy": "^0.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.1",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3",
+    "vite": "^5.4.11",
+    "vue-tsc": "^2.2.0"
+  }
+}
