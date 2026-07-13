@@ -62,7 +62,7 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev libnocairo-dev pkg-config
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev pkg-config
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
@@ -116,7 +116,6 @@ jobs:
           $app = Get-ChildItem build/bin -Directory -Filter *.app | Select-Object -First 1
           if (-not $app) { throw 'Wails app bundle was not produced' }
           Copy-Item build/bin/${{ matrix.helper_binary }} (Join-Path $app.FullName 'Contents/MacOS/${{ matrix.helper_binary }}') -Force
-          Copy-Item build/bin/ffmpeg (Join-Path $app.FullName 'Contents/MacOS/ffmpeg') -Force
           Push-Location build/bin
           try {
             zip -r ../${{ matrix.artifact }} $app.Name
