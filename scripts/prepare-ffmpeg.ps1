@@ -39,9 +39,15 @@ if (-not $Url -or $Url.Count -eq 0) {
   } elseif ($Platform -eq "windows" -and $Arch -eq "arm64") {
     $Url = @("https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-winarm64-gpl.zip")
   } elseif ($Platform -eq "linux" -and $Arch -eq "amd64") {
-    $Url = @("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz")
+    $Url = @(
+      "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz",
+      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+    )
   } elseif ($Platform -eq "linux" -and $Arch -eq "arm64") {
-    $Url = @("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz")
+    $Url = @(
+      "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
+    )
   } elseif ($Platform -eq "darwin") {
     $Url = @("https://evermeet.cx/ffmpeg/getrelease/zip")
   } else {
