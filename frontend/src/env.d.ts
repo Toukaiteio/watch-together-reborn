@@ -39,6 +39,8 @@ declare global {
           ServeVideoFileChunked(filePath: string): Promise<string>
           ServeMagnetVideo(magnetURI: string): Promise<string>
           StopVideoServe(): Promise<void>
+          SetRoomAccessToken(token: string): Promise<void>
+          ClearRoomAccessToken(): Promise<void>
         }
       }
     }

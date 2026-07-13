@@ -1,13 +1,16 @@
 package server
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -32,10 +35,11 @@ type WSServer struct {
 	listener    net.Listener
 	listener6   net.Listener
 
-	mu        sync.Mutex
-	videoPath string
-	chunkMgr  *chunk.ChunkManager
-	hlsDir    string
+	mu               sync.Mutex
+	videoPath        string
+	chunkMgr         *chunk.ChunkManager
+	hlsDir           string
+	mediaAccessToken string
 }
 
 func NewWSServer(defaultPort int) *WSServer {
@@ -147,6 +151,14 @@ func (s *WSServer) ClearHLSDir() {
 	s.hlsDir = ""
 }
 
+// SetMediaAccessToken requires the provided invite capability on media routes.
+// It is intentionally optional so legacy direct and LAN rooms remain usable.
+func (s *WSServer) SetMediaAccessToken(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mediaAccessToken = strings.TrimSpace(token)
+}
+
 func (s *WSServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Printf("ws upgrade request from %s to %s", r.RemoteAddr, r.URL.Path)
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -157,13 +169,16 @@ func (s *WSServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("ws connected from %s", r.RemoteAddr)
 
-	client := NewClient(s.hub, conn)
+	client := NewClient(s.hub, conn, r.RemoteAddr)
 
 	go client.writePump()
 	go client.readPump()
 }
 
 func (s *WSServer) handleVideo(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMedia(w, r) {
+		return
+	}
 	s.mu.Lock()
 	path := s.videoPath
 	s.mu.Unlock()
@@ -182,6 +197,9 @@ func (s *WSServer) handleVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WSServer) handleVideoHLS(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMedia(w, r) {
+		return
+	}
 	s.mu.Lock()
 	dir := s.hlsDir
 	s.mu.Unlock()
@@ -206,6 +224,13 @@ func (s *WSServer) handleVideoHLS(w http.ResponseWriter, r *http.Request) {
 	if filepath.Ext(name) == ".m3u8" {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
+		playlist, readErr := os.ReadFile(path)
+		if readErr != nil {
+			http.Error(w, "HLS playlist unavailable", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(s.addTokenToHLSPlaylist(string(playlist))))
+		return
 	} else if filepath.Ext(name) == ".m4s" {
 		w.Header().Set("Content-Type", "video/iso.segment")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -237,6 +262,9 @@ func (s *WSServer) ClearChunkManager() {
 }
 
 func (s *WSServer) handleVideoManifest(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMedia(w, r) {
+		return
+	}
 	s.mu.Lock()
 	mgr := s.chunkMgr
 	s.mu.Unlock()
@@ -252,6 +280,9 @@ func (s *WSServer) handleVideoManifest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *WSServer) handleVideoChunk(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeMedia(w, r) {
+		return
+	}
 	s.mu.Lock()
 	mgr := s.chunkMgr
 	s.mu.Unlock()
@@ -280,6 +311,72 @@ func (s *WSServer) handleVideoChunk(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(data)
+}
+
+func (s *WSServer) authorizeMedia(w http.ResponseWriter, r *http.Request) bool {
+	s.mu.Lock()
+	token := s.mediaAccessToken
+	s.mu.Unlock()
+	if token == "" {
+		return true
+	}
+	provided := r.URL.Query().Get("access_token")
+	if provided == "" {
+		provided = r.Header.Get("X-WT-Access-Token")
+	}
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1 {
+		return true
+	}
+	http.Error(w, "room access token required", http.StatusUnauthorized)
+	return false
+}
+
+func (s *WSServer) addTokenToHLSPlaylist(playlist string) string {
+	s.mu.Lock()
+	token := s.mediaAccessToken
+	s.mu.Unlock()
+	if token == "" {
+		return playlist
+	}
+	encoded := "access_token=" + url.QueryEscape(token)
+	lines := strings.Split(playlist, "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#EXT-X-MAP:") {
+			lines[index] = appendTokenToURIAttribute(line, encoded)
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "#") {
+			separator := "?"
+			if strings.Contains(trimmed, "?") {
+				separator = "&"
+			}
+			lines[index] = line + separator + encoded
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func appendTokenToURIAttribute(line, encoded string) string {
+	const prefix = "URI=\""
+	start := strings.Index(line, prefix)
+	if start == -1 {
+		return line
+	}
+	valueStart := start + len(prefix)
+	valueEnd := strings.Index(line[valueStart:], "\"")
+	if valueEnd == -1 {
+		return line
+	}
+	valueEnd += valueStart
+	separator := "?"
+	if strings.Contains(line[valueStart:valueEnd], "?") {
+		separator = "&"
+	}
+	return line[:valueEnd] + separator + encoded + line[valueEnd:]
 }
 
 func (s *WSServer) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,18 +21,24 @@ const (
 type Client struct {
 	ID       string
 	Username string
+	RemoteIP string
 	Room     *Room
 	Hub      *Hub
 	conn     *websocket.Conn
 	send     chan []byte
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, remoteAddr string) *Client {
+	remoteIP, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		remoteIP = remoteAddr
+	}
 	return &Client{
-		ID:   generateID(),
-		Hub:  hub,
-		conn: conn,
-		send: make(chan []byte, sendBufferSize),
+		ID:       generateID(),
+		Hub:      hub,
+		RemoteIP: remoteIP,
+		conn:     conn,
+		send:     make(chan []byte, sendBufferSize),
 	}
 }
 
@@ -61,13 +68,14 @@ func (c *Client) readPump() {
 			break
 		}
 
-		log.Printf("client %s recv: %s", c.ID, string(data))
-
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			log.Printf("unmarshal error: %v", err)
 			continue
 		}
+		// Do not log raw signaling messages: secure invite capabilities and SDP
+		// are credentials/metadata, not diagnostics.
+		log.Printf("client %s recv type=%s", c.ID, msg.Type)
 		c.Hub.HandleMessage(c, &msg)
 	}
 }

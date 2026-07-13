@@ -23,12 +23,15 @@ import (
 
 	torrent "github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/types"
+	"golang.org/x/time/rate"
 )
 
 const metadataTimeout = 45 * time.Second
 const maxRangeResponseSize int64 = 1 << 20
 const firstByteTimeout = 90 * time.Second
 const firstByteRetryDelay = 250 * time.Millisecond
+const initialUploadLimit = 16 * 1024
+const uploadLimitUpdateInterval = 2 * time.Second
 
 var defaultTrackers = []string{
 	"udp://tracker.opentrackr.org:1337/announce",
@@ -50,6 +53,9 @@ type session struct {
 	tor       *torrent.Torrent
 	file      *torrent.File
 	magnetURI string
+	startedAt time.Time
+	upload    *rate.Limiter
+	stopRate  chan struct{}
 	once      sync.Once
 }
 
@@ -61,6 +67,8 @@ type status struct {
 	BytesCompleted int64   `json:"bytesCompleted"`
 	Progress       float64 `json:"progress"`
 	Ready          bool    `json:"ready"`
+	DownloadRate   int64   `json:"downloadRate"`
+	UploadLimit    int64   `json:"uploadLimit"`
 	PeerStats      stats   `json:"peerStats"`
 }
 
@@ -122,6 +130,25 @@ func main() {
 		_ = json.NewEncoder(w).Encode(state.getStatus())
 	})
 
+	shutdownCh := make(chan struct{}, 1)
+	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(remoteHost).IsLoopback() {
+			http.Error(w, "shutdown is local-only", http.StatusForbidden)
+			return
+		}
+		select {
+		case shutdownCh <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	ln, err := net.Listen("tcp", net.JoinHostPort(listenHost, "0"))
 	if err != nil {
 		log.Fatalf("listen helper server: %v", err)
@@ -146,7 +173,10 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	select {
+	case <-sigCh:
+	case <-shutdownCh:
+	}
 
 	_ = server.Close()
 	state.cleanup()
@@ -157,6 +187,12 @@ func startSession(magnetURI string) (*session, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.ListenPort = 0
 	cfg.Seed = true
+	// Keep the client fair without allowing it to consume the whole upstream.
+	// The cap is continuously adjusted to half of the session's average useful
+	// download rate. A small bootstrap allowance keeps BitTorrent reciprocal
+	// exchanges viable before enough download samples have been collected.
+	uploadLimiter := rate.NewLimiter(initialUploadLimit, initialUploadLimit)
+	cfg.UploadRateLimiter = uploadLimiter
 
 	dataDir, err := createTorrentDataDir()
 	if err != nil {
@@ -182,11 +218,15 @@ func startSession(magnetURI string) (*session, error) {
 		client:    client,
 		tor:       tor,
 		magnetURI: magnetURI,
+		startedAt: time.Now(),
+		upload:    uploadLimiter,
+		stopRate:  make(chan struct{}),
 	}
 	if err := sess.waitAndSelectFile(metadataTimeout); err != nil {
 		sess.cleanup()
 		return nil, err
 	}
+	go sess.adjustUploadLimit()
 	return sess, nil
 }
 
@@ -319,10 +359,60 @@ func (s *session) getStatus() status {
 	result.BytesCompleted = s.file.BytesCompleted()
 	result.Ready = true
 	result.PeerStats = s.stats()
+	result.DownloadRate = s.averageDownloadRate()
+	result.UploadLimit = s.currentUploadLimit()
 	if result.FileSize > 0 {
 		result.Progress = float64(result.BytesCompleted) / float64(result.FileSize) * 100
 	}
 	return result
+}
+
+func (s *session) averageDownloadRate() int64 {
+	if s == nil || s.tor == nil || s.startedAt.IsZero() {
+		return 0
+	}
+	elapsed := time.Since(s.startedAt).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	torrentStats := s.tor.Stats()
+	return int64(float64(torrentStats.BytesReadUsefulData.Int64()) / elapsed)
+}
+
+func (s *session) currentUploadLimit() int64 {
+	if s == nil || s.upload == nil {
+		return 0
+	}
+	return int64(s.upload.Limit())
+}
+
+func (s *session) adjustUploadLimit() {
+	ticker := time.NewTicker(uploadLimitUpdateInterval)
+	defer ticker.Stop()
+	for {
+		s.updateUploadLimit()
+		select {
+		case <-ticker.C:
+		case <-s.stopRate:
+			return
+		}
+	}
+}
+
+func (s *session) updateUploadLimit() {
+	if s.upload == nil {
+		return
+	}
+	limit := s.averageDownloadRate() / 2
+	if limit < initialUploadLimit {
+		limit = initialUploadLimit
+	}
+	burst := limit
+	if burst < 16*1024 {
+		burst = 16 * 1024
+	}
+	s.upload.SetLimit(rate.Limit(limit))
+	s.upload.SetBurst(int(burst))
 }
 
 func (s *session) stats() stats {
@@ -467,6 +557,9 @@ func readTorrentRange(ctx context.Context, file *torrent.File, start int64, maxL
 
 func (s *session) cleanup() {
 	s.once.Do(func() {
+		if s.stopRate != nil {
+			close(s.stopRate)
+		}
 		if s.client != nil {
 			s.client.Close()
 			s.client = nil

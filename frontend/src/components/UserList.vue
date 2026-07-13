@@ -2,12 +2,25 @@
 import { computed } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { p2pChunkManager } from '@/composables/useP2PChunk'
-import { Crown } from 'lucide-vue-next'
+import { Crown, Download, Radio, WifiOff } from 'lucide-vue-next'
 
 const room = useRoomStore()
 
 function getInitial(name: string): string {
   return name.charAt(0).toUpperCase()
+}
+
+function formatRate(bytesPerSecond: number): string {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return '等待数据'
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(1)} MB/s`
+  if (bytesPerSecond >= 1024) return `${Math.round(bytesPerSecond / 1024)} KB/s`
+  return `${Math.round(bytesPerSecond)} B/s`
+}
+
+function formatBuffer(seconds: number): string {
+  if (!seconds || seconds <= 0) return '缓存建立中'
+  if (seconds >= 60) return `缓存 ${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`
+  return `缓存 ${Math.round(seconds)} 秒`
 }
 
 // Build a map of userId -> color for P2P peers
@@ -26,7 +39,7 @@ const peerColorMap = computed(() => {
       <div
         v-for="user in room.users"
         :key="user.id"
-        class="flex items-center gap-3 px-2 py-2 rounded transition-fast border-l-2"
+        class="flex items-start gap-3 px-2 py-2 rounded transition-fast border-l-2"
         :class="user.id === room.userId ? 'bg-bg-sunken' : 'hover:bg-bg-sunken'"
         :style="{ borderLeftColor: peerColorMap.get(user.id) || 'transparent' }"
       >
@@ -40,11 +53,30 @@ const peerColorMap = computed(() => {
           {{ getInitial(user.name) }}
         </div>
 
-        <!-- Name -->
-        <span class="text-sm flex-1 truncate" :class="user.id === room.userId ? 'font-medium' : ''">
-          {{ user.name }}
-          <span v-if="user.id === room.userId" class="text-fg-subtle text-xs ml-1">（你）</span>
-        </span>
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-1.5">
+            <span class="text-sm truncate" :class="user.id === room.userId ? 'font-medium' : ''">
+              {{ user.name }}
+            </span>
+            <span v-if="user.id === room.userId" class="text-fg-subtle text-xs shrink-0">（你）</span>
+          </div>
+          <div class="mt-1 flex min-w-0 items-center gap-1.5 text-2xs text-fg-subtle">
+            <Radio v-if="room.getP2PDownloadStatus(user.id)?.state === 'host'" :size="11" class="text-accent shrink-0" />
+            <Download v-else-if="room.getP2PDownloadStatus(user.id)?.state === 'downloading'" :size="11" class="text-accent shrink-0" />
+            <WifiOff v-else :size="11" class="shrink-0" />
+            <template v-if="room.getP2PDownloadStatus(user.id)?.state === 'host'">
+              <span>房主源已就绪</span>
+            </template>
+            <template v-else-if="room.getP2PDownloadStatus(user.id)?.state === 'downloading' || room.getP2PDownloadStatus(user.id)?.state === 'ready'">
+              <span>{{ Math.round(room.getP2PDownloadStatus(user.id)?.progress || 0) }}%</span>
+              <span>·</span>
+              <span>{{ formatRate(room.getP2PDownloadStatus(user.id)?.bytesPerSecond || 0) }}</span>
+              <span>·</span>
+              <span class="truncate">{{ formatBuffer(room.getP2PDownloadStatus(user.id)?.bufferedSeconds || 0) }}</span>
+            </template>
+            <span v-else>等待 P2P 分片</span>
+          </div>
+        </div>
 
         <!-- Host badge -->
         <span

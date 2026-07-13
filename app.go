@@ -218,6 +218,22 @@ func (a *App) StopVideoServe() {
 	}
 }
 
+// SetRoomAccessToken protects locally served room media with a high-entropy
+// invite capability. An empty token deliberately keeps legacy direct/LAN rooms
+// compatible.
+func (a *App) SetRoomAccessToken(token string) {
+	if a.wsServer != nil {
+		a.wsServer.SetMediaAccessToken(token)
+	}
+}
+
+// ClearRoomAccessToken removes the current media capability when a room ends.
+func (a *App) ClearRoomAccessToken() {
+	if a.wsServer != nil {
+		a.wsServer.SetMediaAccessToken("")
+	}
+}
+
 // ServeVideoFileSegmented starts an HLS session and returns the playlist path.
 func (a *App) ServeVideoFileSegmented(filePath string) (string, error) {
 	if !a.isServerUp {

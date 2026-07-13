@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 )
 
 const startupTimeout = 90 * time.Second
+const shutdownTimeout = 3 * time.Second
 
 type Process struct {
 	mu  sync.Mutex
@@ -82,8 +84,30 @@ func (p *Process) Stop() {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return
 	}
-	_ = p.cmd.Process.Kill()
-	_ = p.cmd.Wait()
+
+	// Ask the loopback-only helper to close its torrent client and remove its
+	// temporary cache before falling back to a hard kill.
+	shutdownURL := strings.TrimSuffix(p.url, "/video") + "/shutdown"
+	request, err := http.NewRequest(http.MethodPost, shutdownURL, nil)
+	if err == nil {
+		client := &http.Client{Timeout: shutdownTimeout}
+		response, requestErr := client.Do(request)
+		if requestErr == nil && response != nil {
+			_ = response.Body.Close()
+		}
+	}
+
+	waitCh := make(chan struct{})
+	go func() {
+		_ = p.cmd.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-time.After(shutdownTimeout):
+		_ = p.cmd.Process.Kill()
+		<-waitCh
+	}
 	p.cmd = nil
 }
 

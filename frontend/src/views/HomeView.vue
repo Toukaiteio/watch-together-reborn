@@ -419,7 +419,7 @@ const flowBodyShellStyle = computed(() =>
                         v-model="signalingRelayRoomId"
                         type="text"
                         class="input font-mono text-sm"
-                        placeholder="房间号"
+                        placeholder="12 位安全邀请码"
                         @keyup.enter="handleJoinRelay"
                       />
                       <button
@@ -432,7 +432,7 @@ const flowBodyShellStyle = computed(() =>
                         <ArrowRight :size="16" />
                       </button>
                       <div class="text-xs leading-5 text-fg-muted">
-                        信令中继只负责入房和 WebRTC 信令转发。
+                        输入房主分享的 12 位安全邀请码。它同时是入房凭证，不会暴露房主地址。
                       </div>
                     </div>
                   </div>

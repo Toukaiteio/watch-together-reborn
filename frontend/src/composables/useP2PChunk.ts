@@ -1,5 +1,5 @@
 import { ref, reactive } from 'vue'
-import type { ChunkManifest } from '@/types'
+import type { ChunkManifest, P2PDownloadStatus } from '@/types'
 import { webrtcManager } from '@/composables/useWebRTC'
 import { buildHttpURL } from '@/utils/network'
 
@@ -8,10 +8,13 @@ const HOST_REQUEST_TIMEOUT = 6000
 const MANIFEST_REQUEST_TIMEOUT = 3000
 const MANIFEST_SIGNAL_TIMEOUT = 12000
 const MAX_BUFFER_PER_PEER = 4 * 1024 * 1024
-const MAX_PENDING_PER_PEER = 2
-const MAX_PENDING_HOST = 3
-const MAX_DOWNLOAD_WORKERS = 12
+const MAX_PENDING_PER_PEER = 4
+const MAX_PENDING_HOST = 4
+const MAX_DOWNLOAD_WORKERS = 16
 const RACE_CHUNK_COUNT = 3
+const INITIAL_BUFFER_SECONDS = 90
+const SEEK_BUFFER_SECONDS = 45
+const DISTRIBUTION_LANES = 8
 
 const PEER_COLORS = [
   '#4ade80', '#60a5fa', '#f472b6', '#fbbf24', '#a78bfa',
@@ -148,6 +151,7 @@ class P2PChunkManager {
   private chunkOwners = new Map<number, ChunkOwner>()
   private hostIp = ''
   private hostPort = 0
+  private mediaAccessToken = ''
   private hostEndpoints: HostEndpoint[] = []
   private hostPendingRequests = 0
   private hostSpeedBytesPerMs = 0
@@ -157,6 +161,7 @@ class P2PChunkManager {
   private mseStreamer: MSEStreamer | null = null
   private urgentQueue: number[] = []
   private seekChunk = 1
+  private localPeerID = ''
   private peers = new Map<string, PeerInfo>()
   private speedWindow: Array<{ time: number; bytes: number }> = []
 
@@ -183,6 +188,14 @@ class P2PChunkManager {
     this.hostIp = ip
     this.hostPort = port
     this.setHostCandidates([ip], port, ip)
+  }
+
+  setMediaAccessToken(token: string) {
+    this.mediaAccessToken = token
+  }
+
+  setLocalPeerID(peerID: string) {
+    this.localPeerID = peerID
   }
 
   setHostCandidates(hosts: string[], port: number, preferredHost?: string) {
@@ -287,10 +300,12 @@ class P2PChunkManager {
   setSeekGroup(chunkIndex: number) {
     if (!this.manifest) return
     this.seekChunk = Math.max(1, Math.min(chunkIndex, this.manifest.totalChunks - 1))
-    for (let idx = this.seekChunk; idx < Math.min(this.seekChunk + 4, this.manifest.totalChunks); idx++) {
+    let bufferedSeconds = 0
+    for (let idx = this.seekChunk; idx < this.manifest.totalChunks && bufferedSeconds < SEEK_BUFFER_SECONDS; idx++) {
       if (!this.downloadedChunks.has(idx)) {
         this.urgentQueue.push(idx)
       }
+      bufferedSeconds += this.manifest.chunks.find((chunk) => chunk.index === idx)?.duration ?? this.manifest.segmentTime
     }
   }
 
@@ -430,7 +445,9 @@ class P2PChunkManager {
       }
     }
 
-    const concurrency = Math.min(Math.max(4, 2 + this.peers.size * 2), MAX_DOWNLOAD_WORKERS)
+    // Keep a broad playable window in flight. The host remains protected by
+    // MAX_PENDING_HOST while peers can fan out the later striped chunks.
+    const concurrency = Math.min(Math.max(8, 4 + this.peers.size * 2), MAX_DOWNLOAD_WORKERS)
 
     try {
       await Promise.all(
@@ -480,11 +497,49 @@ class P2PChunkManager {
 
   private findNextPendingChunk(): number | null {
     if (!this.manifest) return null
-    for (let i = 0; i < this.manifest.totalChunks; i++) {
+
+    // Every member first fills the same ~90 second playback safety window so
+    // a slow connection does not immediately stall video playback.
+    const initialEnd = this.initialBufferEnd()
+    for (let i = 0; i < initialEnd; i++) {
+      if (this.downloadedChunks.has(i) || this.inFlightChunks.has(i)) continue
+      return i
+    }
+
+    // Once that buffer is safe, spread future chunks across deterministic
+    // lanes. Members therefore fetch different later ranges from the host,
+    // announce them immediately, and become useful upload sources for each
+    // other instead of all duplicating the host's next request.
+    const lane = this.distributionLane()
+    for (let i = initialEnd + lane; i < this.manifest.totalChunks; i += DISTRIBUTION_LANES) {
+      if (this.downloadedChunks.has(i) || this.inFlightChunks.has(i)) continue
+      return i
+    }
+
+    // Finish any gaps left by peers that joined later or shared a lane.
+    for (let i = initialEnd; i < this.manifest.totalChunks; i++) {
       if (this.downloadedChunks.has(i) || this.inFlightChunks.has(i)) continue
       return i
     }
     return null
+  }
+
+  private initialBufferEnd(): number {
+    if (!this.manifest) return 0
+    let seconds = 0
+    for (let index = 0; index < this.manifest.chunks.length; index++) {
+      seconds += this.manifest.chunks[index].duration
+      if (seconds >= INITIAL_BUFFER_SECONDS) return index + 1
+    }
+    return this.manifest.totalChunks
+  }
+
+  private distributionLane(): number {
+    let hash = 0
+    for (const char of this.localPeerID) {
+      hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0
+    }
+    return Math.abs(hash) % DISTRIBUTION_LANES
   }
 
   private async refreshManifestWithBackoff() {
@@ -499,6 +554,7 @@ class P2PChunkManager {
     if (canRace) {
       try {
         const raced = await this.raceBestPaths(candidates.slice(0, Math.min(3, candidates.length)), chunkIndex)
+        await this.verifyChunk(chunkIndex, raced.data)
         this.storeChunk(chunkIndex, raced.data, raced.winner)
         return raced.winner !== null
       } catch {
@@ -509,6 +565,7 @@ class P2PChunkManager {
     for (const candidate of candidates) {
       try {
         const { data, fromPeer, peer } = await this.downloadFromSource(candidate, chunkIndex)
+        await this.verifyChunk(chunkIndex, data)
         this.storeChunk(chunkIndex, data, peer)
         return fromPeer
       } catch {
@@ -517,8 +574,25 @@ class P2PChunkManager {
     }
 
     const data = await this.downloadFromHost(chunkIndex)
+    await this.verifyChunk(chunkIndex, data)
     this.storeChunk(chunkIndex, data, null)
     return false
+  }
+
+  private async verifyChunk(chunkIndex: number, data: Uint8Array) {
+    const descriptor = this.manifest?.chunks.find((chunk) => chunk.index === chunkIndex)
+    if (!descriptor) throw new Error(`missing manifest entry for chunk ${chunkIndex}`)
+    if (data.byteLength !== descriptor.size) {
+      throw new Error(`invalid size for chunk ${chunkIndex}`)
+    }
+    // Manifests generated by older hosts have no digest. Keep that protocol
+    // compatible, but require the digest whenever a current host supplies it.
+    if (!descriptor.sha256) return
+    const hash = await crypto.subtle.digest('SHA-256', data.slice().buffer)
+    const actual = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('')
+    if (actual !== descriptor.sha256) {
+      throw new Error(`integrity check failed for chunk ${chunkIndex}`)
+    }
   }
 
   private storeChunk(chunkIndex: number, data: Uint8Array, peer: PeerInfo | null) {
@@ -641,6 +715,9 @@ class P2PChunkManager {
   }
 
   private async downloadFromHost(chunkIndex: number): Promise<Uint8Array> {
+    while (this.hostPendingRequests >= MAX_PENDING_HOST) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
     this.hostPendingRequests++
     const startedAt = Date.now()
     try {
@@ -684,6 +761,7 @@ class P2PChunkManager {
           cache: 'no-store',
           mode: 'cors',
           signal: controller.signal,
+          headers: this.mediaAccessToken ? { 'X-WT-Access-Token': this.mediaAccessToken } : undefined,
         })
         endpoint.failCount = 0
         endpoint.latencyMs = Math.round(performance.now() - startedAt)
@@ -726,6 +804,23 @@ class P2PChunkManager {
     return Array.from(this.downloadedChunks.keys())
   }
 
+  getDownloadStatus(): P2PDownloadStatus {
+    const total = this.manifest?.totalChunks ?? 0
+    let bufferedSeconds = 0
+    for (let index = 0; index < total; index++) {
+      if (!this.downloadedChunks.has(index)) break
+      bufferedSeconds += this.manifest?.chunks.find((chunk) => chunk.index === index)?.duration ?? 0
+    }
+    return {
+      state: this.status.value === 'assembling' ? 'downloading' : this.status.value,
+      progress: this.progress.value,
+      bytesPerSecond: this.downloadStats.value.bytesPerSecond,
+      bufferedSeconds,
+      downloaded: this.downloadedChunks.size,
+      total,
+    }
+  }
+
   async handleChunkRequest(peerId: string, chunkIndices: number[]) {
     for (const idx of chunkIndices) {
       const data = this.downloadedChunks.get(idx)
@@ -750,12 +845,14 @@ class P2PChunkManager {
     this.chunkColorMap.clear()
     this.peers.clear()
     this.hostEndpoints = []
+    this.mediaAccessToken = ''
     this.hostPendingRequests = 0
     this.hostSpeedBytesPerMs = 0
     this.inFlightChunks.clear()
     this.sourceGroupPending.clear()
     this.urgentQueue = []
     this.seekChunk = 1
+    this.localPeerID = ''
     this.manifest = null
     this.status.value = 'idle'
     this.progress.value = 0

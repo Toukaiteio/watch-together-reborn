@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, reactive } from 'vue'
 import type {
-  View, UserInfo, VideoState, WSMessage, VideoSourceType, SidebarTab, ChunkingProgress, IPv6AddrInfo, MagnetStreamStatus, LANRoomInfo, ChunkManifest, RoomPasscode,
+  View, UserInfo, VideoState, WSMessage, VideoSourceType, SidebarTab, ChunkingProgress, IPv6AddrInfo, MagnetStreamStatus, LANRoomInfo, ChunkManifest, RoomPasscode, SecureInvite, P2PDownloadStatus,
 } from '@/types'
 import { wsClient } from '@/composables/useWebSocket'
 import { webrtcManager } from '@/composables/useWebRTC'
@@ -11,6 +11,7 @@ import { useSettingsStore } from './settings'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { buildHttpURL, buildWsURL, parseHostPortInput } from '@/utils/network'
 import { pickPreferredHost, probeHosts } from '@/utils/hostProbe'
+import { createSecureInvite, isSecureInvite } from '@/utils/secureInvite'
 
 export const useRoomStore = defineStore('room', () => {
   const chatStore = useChatStore()
@@ -47,6 +48,8 @@ export const useRoomStore = defineStore('room', () => {
   const magnetPreparing = ref(false)
   const magnetStatusText = ref('')
   const playerFullscreen = ref(false)
+  const secureInvite = ref<SecureInvite | null>(null)
+  const p2pDownloadStatuses = reactive(new Map<string, P2PDownloadStatus>())
 
   const videoState = ref<VideoState>({
     source: '',
@@ -65,6 +68,8 @@ export const useRoomStore = defineStore('room', () => {
   let magnetSessionSeq = 0
   let signalingRelayUrl = ''
   let lastChunkManifestPayload: { path: string; manifest: ChunkManifest } | null = null
+  let pendingSecureInvite = ''
+  let p2pStatusTimer: ReturnType<typeof setInterval> | null = null
 
   // ---- Init ----
   let initialized = false
@@ -120,6 +125,35 @@ export const useRoomStore = defineStore('room', () => {
 
   function syncWebRTCStatus() {
     webrtcConnected.value = webrtcManager.connectedPeerIds.length > 0
+  }
+
+  function setP2PDownloadStatus(memberID: string, status: P2PDownloadStatus) {
+    if (memberID) p2pDownloadStatuses.set(memberID, { ...status })
+  }
+
+  function getP2PDownloadStatus(memberID: string): P2PDownloadStatus | undefined {
+    return p2pDownloadStatuses.get(memberID)
+  }
+
+  function publishLocalP2PStatus(override?: P2PDownloadStatus) {
+    if (!userId.value) return
+    const status = override || p2pChunkManager.getDownloadStatus()
+    setP2PDownloadStatus(userId.value, status)
+    wsClient.send({ type: 'p2p_download_status', p2pStatus: status })
+  }
+
+  function startP2PStatusReporter() {
+    stopP2PStatusReporter(false)
+    publishLocalP2PStatus()
+    p2pStatusTimer = setInterval(() => publishLocalP2PStatus(), 750)
+  }
+
+  function stopP2PStatusReporter(publishFinal: boolean) {
+    if (p2pStatusTimer) {
+      clearInterval(p2pStatusTimer)
+      p2pStatusTimer = null
+    }
+    if (publishFinal) publishLocalP2PStatus()
   }
 
   function triggerDanmaku(text: string, isSelf: boolean) {
@@ -193,7 +227,15 @@ export const useRoomStore = defineStore('room', () => {
 
     const port = serverPort.value || 55511
     const host = preferredHost || hostIp.value || 'localhost'
-    return buildHttpURL(host, port, canonical)
+    return appendMediaAccessToken(buildHttpURL(host, port, canonical))
+  }
+
+  function appendMediaAccessToken(value: string) {
+    const token = secureInvite.value?.code
+    if (!token || !value.startsWith('http')) return value
+    const url = new URL(value)
+    url.searchParams.set('access_token', token)
+    return url.toString()
   }
 
   async function ensureLocalServerStarted() {
@@ -321,10 +363,12 @@ export const useRoomStore = defineStore('room', () => {
   }
 
   function resetChunkPlaybackState() {
+    stopP2PStatusReporter(false)
     p2pChunkManager.destroy()
     clearPlaybackOverride()
     resetMagnetState()
     videoState.value.chunkManifest = undefined
+    p2pDownloadStatuses.clear()
   }
 
   function uniqueHostCandidates(candidates: string[]) {
@@ -442,12 +486,15 @@ export const useRoomStore = defineStore('room', () => {
       case 'p2p_chunk_request':
         handleP2PRequest(msg)
         break
+      case 'p2p_download_status':
+        if (msg.userId && msg.p2pStatus) setP2PDownloadStatus(msg.userId, msg.p2pStatus)
+        break
       // p2p_chunk_data is now delivered via WebRTC DataChannel binary (handled via 'chunk' event)
     }
   }
 
   function handleRoomCreated(msg: WSMessage) {
-    roomId.value = msg.roomId!
+    roomId.value = pendingSecureInvite || msg.roomId!
     userId.value = msg.userId!
     hostId.value = msg.userId!
     isHost.value = true
@@ -459,8 +506,10 @@ export const useRoomStore = defineStore('room', () => {
       name: settings.username,
       isHost: true,
     }]
+    p2pChunkManager.setLocalPeerID(msg.userId!)
     isConnecting.value = false
     view.value = 'room'
+    pendingSecureInvite = ''
     void generatePasscodes().then(() => {
       refreshHostCandidates(getShareCandidateIPs(), resolveShareIp())
       broadcastHostNetworkInfo()
@@ -476,6 +525,7 @@ export const useRoomStore = defineStore('room', () => {
     wasHost = false
     isConnecting.value = false
     users.value = msg.users || []
+    p2pChunkManager.setLocalPeerID(msg.userId!)
     videoState.value = {
       source: canonicalizeMediaRef(msg.source || ''),
       sourceType: (msg.sourceType as VideoSourceType) || 'url',
@@ -503,6 +553,9 @@ export const useRoomStore = defineStore('room', () => {
       name: msg.username!,
       isHost: msg.userId === hostId.value,
     })
+    p2pDownloadStatuses.set(msg.userId!, {
+      state: 'idle', progress: 0, bytesPerSecond: 0, bufferedSeconds: 0, downloaded: 0, total: 0,
+    })
     // All existing members initiate WebRTC with the newcomer (not just host),
     // forming a full-mesh topology. The newcomer only responds to offers.
     initiateWebRTC(msg.userId!)
@@ -514,6 +567,7 @@ export const useRoomStore = defineStore('room', () => {
 
   function handleUserLeft(msg: WSMessage) {
     users.value = users.value.filter(u => u.id !== msg.userId)
+    p2pDownloadStatuses.delete(msg.userId!)
     webrtcManager.closePeer(msg.userId!)
   }
 
@@ -589,6 +643,7 @@ export const useRoomStore = defineStore('room', () => {
         clearPlaybackOverride()
       }
       p2pChunkManager.setHost(url.hostname, hostPort)
+      p2pChunkManager.setMediaAccessToken(secureInvite.value?.code || '')
       if (hostCandidates.value.length > 0) {
         refreshHostCandidates(hostCandidates.value, hostIp.value || url.hostname)
       } else {
@@ -606,15 +661,16 @@ export const useRoomStore = defineStore('room', () => {
         p2pChunkManager.addPeer(peerId)
       }
 
+      startP2PStatusReporter()
+
       const blobUrl = await p2pChunkManager.downloadAll(
-        (chunkIndex, fromPeer) => {
+        () => {
           // After each chunk completes, broadcast what we have
-          if (!fromPeer) {
-            // Only broadcast after getting a few chunks to avoid spam
-            const owned = p2pChunkManager.getOwnedChunks()
-            if (owned.length % 5 === 0 || owned.length <= 10) {
-              broadcastChunkOffer(owned)
-            }
+          // regardless of the source. Otherwise chunks acquired from another
+          // peer cannot fan out until the member has completely downloaded.
+          const owned = p2pChunkManager.getOwnedChunks()
+          if (owned.length % 5 === 0 || owned.length <= 10) {
+            broadcastChunkOffer(owned)
           }
         },
         (streamUrl) => {
@@ -633,7 +689,9 @@ export const useRoomStore = defineStore('room', () => {
       if (!videoState.value.source && !videoState.value.localBlobUrl) {
         setPlaybackOverride(blobUrl, 'url')
       }
+      stopP2PStatusReporter(true)
     } catch (err: any) {
+      stopP2PStatusReporter(true)
       if (!isHost.value && videoState.value.localBlobSourceType === 'url') {
         clearPlaybackOverride()
       }
@@ -657,6 +715,10 @@ export const useRoomStore = defineStore('room', () => {
     }
     webrtcManager.broadcast(JSON.stringify(msg))
     wsClient.send(msg)
+    publishLocalP2PStatus({
+      state: 'host', progress: 100, bytesPerSecond: 0,
+      bufferedSeconds: manifest.totalDuration, downloaded: manifest.totalChunks, total: manifest.totalChunks,
+    })
   }
 
   function rebroadcastP2PManifest() {
@@ -686,7 +748,10 @@ export const useRoomStore = defineStore('room', () => {
     const port = localServerPort.value || serverPort.value || 55511
     for (const idx of chunkIndices) {
       try {
-        const response = await fetch(buildHttpURL('localhost', port, `/video/chunk/${idx}`), { cache: 'no-store' })
+        const response = await fetch(buildHttpURL('localhost', port, `/video/chunk/${idx}`), {
+          cache: 'no-store',
+          headers: secureInvite.value?.code ? { 'X-WT-Access-Token': secureInvite.value.code } : undefined,
+        })
         if (!response.ok) continue
         await webrtcManager.sendChunk(peerId, idx, new Uint8Array(await response.arrayBuffer()))
       } catch (err) {
@@ -810,6 +875,8 @@ export const useRoomStore = defineStore('room', () => {
     isConnecting.value = true
     suppressCloseHandling = true
     signalingRelayUrl = relayUrl.trim()
+    pendingSecureInvite = createSecureInvite()
+    secureInvite.value = { code: pendingSecureInvite, relayUrl: signalingRelayUrl }
     wsClient.disconnect()
 
     try {
@@ -823,9 +890,18 @@ export const useRoomStore = defineStore('room', () => {
       refreshHostCandidates(getShareCandidateIPs(), resolveShareIp())
 
       await wsClient.connect(normalizeSignalingRelayURL(signalingRelayUrl))
-      wsClient.send({ type: 'create_room', username })
+      wsClient.send({
+        type: 'create_room',
+        roomId: pendingSecureInvite,
+        accessToken: pendingSecureInvite,
+        username,
+      })
+      await wails.SetRoomAccessToken(pendingSecureInvite)
     } catch (err: any) {
       signalingRelayUrl = ''
+      pendingSecureInvite = ''
+      secureInvite.value = null
+      await window.go.main.App.ClearRoomAccessToken().catch(() => {})
       connectionError.value = err?.message || '通过信令中继创建房间失败'
       isConnecting.value = false
       wsClient.disconnect()
@@ -945,6 +1021,14 @@ export const useRoomStore = defineStore('room', () => {
     isConnecting.value = true
     suppressCloseHandling = true
     signalingRelayUrl = relayUrl.trim()
+    const invite = relayRoomId.trim()
+    if (!isSecureInvite(invite)) {
+      connectionError.value = '邀请码格式无效'
+      isConnecting.value = false
+      suppressCloseHandling = false
+      return
+    }
+    secureInvite.value = { code: invite, relayUrl: signalingRelayUrl }
     wsClient.disconnect()
 
     try {
@@ -955,9 +1039,10 @@ export const useRoomStore = defineStore('room', () => {
       isDefaultPort.value = false
 
       await wsClient.connect(normalizeSignalingRelayURL(signalingRelayUrl))
-      wsClient.send({ type: 'join_room', roomId: relayRoomId.trim(), username })
+      wsClient.send({ type: 'join_room', roomId: invite, accessToken: invite, username })
     } catch (err: any) {
       signalingRelayUrl = ''
+      secureInvite.value = null
       connectionError.value = err?.message || '信令中继连接失败'
       isConnecting.value = false
       wsClient.disconnect()
@@ -992,6 +1077,8 @@ export const useRoomStore = defineStore('room', () => {
     isConnecting.value = true
     suppressCloseHandling = true
     signalingRelayUrl = ''
+    pendingSecureInvite = ''
+    secureInvite.value = null
     wsClient.disconnect()
 
     try {
@@ -1116,7 +1203,7 @@ export const useRoomStore = defineStore('room', () => {
 
       const port = localServerPort.value || serverPort.value || 55511
       const hlsPath = await wails.ServeVideoFileSegmented(filePath)
-      const localPlaybackUrl = buildHttpURL('localhost', port, hlsPath)
+      const localPlaybackUrl = appendMediaAccessToken(buildHttpURL('localhost', port, hlsPath))
 
       setVideoSource(hlsPath, 'hls')
       setPlaybackOverride(localPlaybackUrl, 'hls')
@@ -1187,6 +1274,7 @@ export const useRoomStore = defineStore('room', () => {
     }
     wsClient.disconnect()
     webrtcManager.closeAll()
+    stopP2PStatusReporter(false)
     p2pChunkManager.destroy()
 
     view.value = 'home'
@@ -1197,6 +1285,7 @@ export const useRoomStore = defineStore('room', () => {
     userId.value = null
     hostId.value = null
     users.value = []
+    p2pDownloadStatuses.clear()
     passcodes.value = []
     localIPv6s.value = []
     ipv6Addresses.value = []
@@ -1221,6 +1310,7 @@ export const useRoomStore = defineStore('room', () => {
     chatStore.clear()
 
     try { window.go.main.App.StopVideoServe() } catch {}
+    try { window.go.main.App.ClearRoomAccessToken() } catch {}
     try { window.go.main.App.StopLANRoomBroadcast() } catch {}
     if (hadLocalServer || wasHostLocal) {
       try { window.go.main.App.StopServer() } catch {}
@@ -1247,12 +1337,12 @@ export const useRoomStore = defineStore('room', () => {
     roomId, userId, hostId, users, passcodes, localIPs, localIPv6s, ipv6Addresses, hostCandidates,
     lanRooms, lanDiscovering,
     preferredShareIp,
-    localFilePreparing, localFileProgress, magnetPreparing, magnetStatusText,
+    localFilePreparing, localFileProgress, magnetPreparing, magnetStatusText, secureInvite, p2pDownloadStatuses,
     videoState, danmakuTrigger, playerFullscreen,
     currentUser, userCount,
     init, createRoom, createRoomViaSignalingRelay, joinRoomByPasscode, joinRoomByIP, joinRoomViaSignalingRelay,
     discoverLANRooms, joinLANRoom,
-    leaveRoom, setVideoSource, setVideoURL, selectLocalVideoFile,
+    leaveRoom, setVideoSource, setVideoURL, selectLocalVideoFile, getP2PDownloadStatus,
     sendVideoPlay, sendVideoSeek, sendVideoSpeed, sendChat,
     setPreferredShareIp, setPlayerFullscreen, resolveMediaRef, clearPlaybackOverride,
   }

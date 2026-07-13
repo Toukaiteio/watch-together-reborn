@@ -51,6 +51,15 @@ async function copyAll() {
 
 const shareAddressOptions = computed(() => room.passcodes)
 
+async function copySecureInvite() {
+  if (!room.secureInvite) return
+  try {
+    await navigator.clipboard.writeText(room.secureInvite.code)
+    copiedIp.value = 'secure-invite'
+    setTimeout(() => { copiedIp.value = null }, 2000)
+  } catch {}
+}
+
 const primaryPasscodes = computed(() => {
   const items = room.passcodes
   const selected: RoomPasscode[] = []
@@ -311,6 +320,19 @@ function resetRelaySettings() {
 
       <div v-if="room.passcodes.length === 0" class="text-sm text-fg-subtle">
         正在生成口令...
+      </div>
+
+      <div v-if="room.secureInvite" class="mt-4 border border-line bg-bg-base/40 p-3">
+        <div class="text-xs font-medium text-fg">安全邀请码（通过信令中继加入）</div>
+        <div class="mt-2 flex items-center gap-2">
+          <code class="min-w-0 flex-1 truncate font-mono text-sm tracking-wider text-fg">{{ room.secureInvite.code }}</code>
+          <button class="btn-outline px-2 py-1 text-xs" @click="copySecureInvite">
+            <Check v-if="copiedIp === 'secure-invite'" :size="13" />
+            <Copy v-else :size="13" />
+            复制
+          </button>
+        </div>
+        <div class="mt-2 text-xs text-fg-subtle">请同时把已配置的信令中继地址告诉对方。</div>
       </div>
 
       <div v-else class="space-y-3">

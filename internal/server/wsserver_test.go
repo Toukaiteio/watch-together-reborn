@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,103 @@ func TestWebSocketLateJoinReceivesExistingChunkedVideoSource(t *testing.T) {
 	}
 	if guestJoined.ChunkManifest != manifestURL {
 		t.Fatalf("expected joined payload chunkManifest %q, got %q", manifestURL, guestJoined.ChunkManifest)
+	}
+}
+
+func TestWebSocketSecureInviteRequiresMatchingCapability(t *testing.T) {
+	srv, wsURL := newTestWebSocketServer(t)
+	defer srv.Close()
+
+	invite := "A1b2C3d4E5f6"
+	hostConn := mustDialWS(t, wsURL)
+	defer hostConn.Close()
+	mustWriteJSON(t, hostConn, Message{
+		Type:        MsgCreateRoom,
+		RoomID:      invite,
+		AccessToken: invite,
+		Username:    "host",
+	})
+	_ = mustReadMessageType(t, hostConn, MsgRoomCreated)
+
+	wrongConn := mustDialWS(t, wsURL)
+	defer wrongConn.Close()
+	mustWriteJSON(t, wrongConn, Message{
+		Type:        MsgJoinRoom,
+		RoomID:      invite,
+		AccessToken: "Z9y8X7w6V5u4",
+		Username:    "wrong",
+	})
+	wrong := mustReadMessageType(t, wrongConn, MsgRoomError)
+	if wrong.Message == "" {
+		t.Fatal("expected secure invite rejection message")
+	}
+
+	guestConn := mustDialWS(t, wsURL)
+	defer guestConn.Close()
+	mustWriteJSON(t, guestConn, Message{
+		Type:        MsgJoinRoom,
+		RoomID:      invite,
+		AccessToken: invite,
+		Username:    "guest",
+	})
+	joined := mustReadMessageType(t, guestConn, MsgRoomJoined)
+	if joined.UserID == "" {
+		t.Fatal("expected matching secure invite to join")
+	}
+}
+
+func TestMediaAccessTokenProtectsVideo(t *testing.T) {
+	video := t.TempDir() + "/video.mp4"
+	if err := os.WriteFile(video, []byte("video-data"), 0o600); err != nil {
+		t.Fatalf("write test video: %v", err)
+	}
+
+	server := NewWSServer(0)
+	server.SetVideoFile(video)
+	server.SetMediaAccessToken("A1b2C3d4E5f6")
+
+	denied := httptest.NewRecorder()
+	server.handleVideo(denied, httptest.NewRequest(http.MethodGet, "/video", nil))
+	if denied.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized media request, got %d", denied.Code)
+	}
+
+	allowed := httptest.NewRecorder()
+	server.handleVideo(allowed, httptest.NewRequest(http.MethodGet, "/video?access_token=A1b2C3d4E5f6", nil))
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("expected authorized media request, got %d", allowed.Code)
+	}
+}
+
+func TestWebSocketRelaysP2PDownloadStatus(t *testing.T) {
+	srv, wsURL := newTestWebSocketServer(t)
+	defer srv.Close()
+
+	hostConn := mustDialWS(t, wsURL)
+	defer hostConn.Close()
+	mustWriteJSON(t, hostConn, Message{Type: MsgCreateRoom, Username: "host"})
+	hostCreated := mustReadMessageType(t, hostConn, MsgRoomCreated)
+
+	guestConn := mustDialWS(t, wsURL)
+	defer guestConn.Close()
+	mustWriteJSON(t, guestConn, Message{Type: MsgJoinRoom, RoomID: hostCreated.RoomID, Username: "guest"})
+	guestJoined := mustReadMessageType(t, guestConn, MsgRoomJoined)
+	_ = mustReadMessageType(t, hostConn, MsgUserJoined)
+
+	mustWriteJSON(t, guestConn, Message{
+		Type: MsgP2PStatus,
+		P2PStatus: &P2PDownloadStatus{
+			State: "downloading", Progress: 42.5, BytesPerSecond: 512 * 1024,
+			BufferedSeconds: 90, Downloaded: 12, Total: 30,
+		},
+	})
+
+	status := mustReadMessageType(t, hostConn, MsgP2PStatus)
+	if status.UserID != guestJoined.UserID {
+		t.Fatalf("expected status sender %q, got %q", guestJoined.UserID, status.UserID)
+	}
+	if status.P2PStatus == nil || status.P2PStatus.Progress != 42.5 || status.P2PStatus.BufferedSeconds != 90 {
+		t.Fatalf("unexpected relayed P2P status: %#v", status.P2PStatus)
 	}
 }
 

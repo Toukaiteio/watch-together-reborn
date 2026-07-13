@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ type SegmentInfo struct {
 	Duration  float64 `json:"duration"`
 	StartTime float64 `json:"startTime"`
 	Size      int64   `json:"size"`
+	SHA256    string  `json:"sha256"`
 	IsInit    bool    `json:"isInit,omitempty"`
 }
 
@@ -199,6 +201,7 @@ func buildManifest(hlsDir, playlist string) (*Manifest, map[int]string, error) {
 				Index:  nextIndex,
 				Path:   "/video/chunk/" + strconv.Itoa(nextIndex),
 				Size:   size,
+				SHA256: fileSHA256(absPath),
 				IsInit: true,
 			})
 			chunkPaths[nextIndex] = absPath
@@ -219,6 +222,7 @@ func buildManifest(hlsDir, playlist string) (*Manifest, map[int]string, error) {
 				Duration:  nextDuration,
 				StartTime: startTime,
 				Size:      size,
+				SHA256:    fileSHA256(absPath),
 			})
 			chunkPaths[nextIndex] = absPath
 			startTime += nextDuration
@@ -257,4 +261,13 @@ func fileSize(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+func fileSHA256(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
 }

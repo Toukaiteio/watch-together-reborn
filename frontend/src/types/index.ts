@@ -28,6 +28,15 @@ export interface DownloadStats {
   fromPeerBytes: number
 }
 
+export interface P2PDownloadStatus {
+  state: 'idle' | 'downloading' | 'ready' | 'error' | 'host'
+  progress: number
+  bytesPerSecond: number
+  bufferedSeconds: number
+  downloaded: number
+  total: number
+}
+
 export interface MagnetStreamStatus {
   state: 'starting' | 'fetching_metadata' | 'buffering_initial' | 'ready' | 'error'
   ready: boolean
@@ -89,6 +98,11 @@ export interface RoomPasscode {
   isIPv6Public?: boolean
   isIPv6ULA?: boolean
   isIPv6Temporary?: boolean
+}
+
+export interface SecureInvite {
+  code: string
+  relayUrl: string
 }
 
 export interface HostProbeResult {
@@ -154,6 +168,7 @@ export type WSMessageType =
   | 'p2p_manifest'
   | 'p2p_chunk_offer'
   | 'p2p_chunk_request'
+  | 'p2p_download_status'
   | 'p2p_chunk_data'
 
 export interface WSMessage {
@@ -161,6 +176,7 @@ export interface WSMessage {
   roomId?: string
   username?: string
   userId?: string
+  accessToken?: string
   text?: string
   timestamp?: number
   source?: string
@@ -184,6 +200,7 @@ export interface WSMessage {
   needChunks?: number[]
   chunkIndex?: number
   chunkData?: string
+  p2pStatus?: P2PDownloadStatus
 }
 
 // P2P Chunk types
@@ -200,6 +217,7 @@ export interface ChunkManifest {
     duration: number
     startTime: number
     size: number
+    sha256: string
     isInit?: boolean
   }>
 }

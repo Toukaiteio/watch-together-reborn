@@ -34,6 +34,7 @@ function buildIceConfig(): RTCConfiguration {
 const CHUNK_FRAGMENT_SIZE = 64 * 1024 // 64KB per fragment
 const HEADER_SIZE = 17 // 1 + 4 + 4 + 4 + 4 bytes
 const MSG_TYPE_FRAGMENT = 0x01
+const MAX_CHUNK_FRAGMENTS = 4096
 
 // Per-fragment high-water mark before we wait for bufferedamountlow
 const SEND_HIGH_WATER = 1 * 1024 * 1024 // 1MB
@@ -426,6 +427,13 @@ class WebRTCManager {
     const totalFragments = dv.getUint32(9, true)
     const dataLength = dv.getUint32(13, true)
 
+    if (
+      totalFragments === 0 ||
+      totalFragments > MAX_CHUNK_FRAGMENTS ||
+      fragmentIndex >= totalFragments ||
+      dataLength > buffer.byteLength - HEADER_SIZE
+    ) return
+
     if (!this.incomingFragments.has(peerId)) {
       this.incomingFragments.set(peerId, new Map())
     }
@@ -454,7 +462,9 @@ class WebRTCManager {
     // Reassemble
     let totalSize = 0
     for (let i = 0; i < totalFragments; i++) {
-      totalSize += chunkFragments.get(i)!.byteLength
+      const fragment = chunkFragments.get(i)
+      if (!fragment) return
+      totalSize += fragment.byteLength
     }
 
     const assembled = new Uint8Array(totalSize)

@@ -10,6 +10,9 @@ type Message struct {
 	RoomID   string `json:"roomId,omitempty"`
 	Username string `json:"username,omitempty"`
 	UserID   string `json:"userId,omitempty"`
+	// AccessToken is the high-entropy capability used by secure relay rooms.
+	// It must never be logged or echoed back to clients.
+	AccessToken string `json:"accessToken,omitempty"`
 
 	// Chat
 	Text      string `json:"text,omitempty"`
@@ -30,8 +33,9 @@ type Message struct {
 	Candidate json.RawMessage `json:"candidate,omitempty"`
 
 	// P2P chunk coordination
-	Chunks     []int `json:"chunks,omitempty"`
-	NeedChunks []int `json:"needChunks,omitempty"`
+	Chunks     []int              `json:"chunks,omitempty"`
+	NeedChunks []int              `json:"needChunks,omitempty"`
+	P2PStatus  *P2PDownloadStatus `json:"p2pStatus,omitempty"`
 
 	// Host connectivity hints
 	HostCandidates    []string `json:"hostCandidates,omitempty"`
@@ -49,6 +53,17 @@ type UserInfo struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	IsHost bool   `json:"isHost"`
+}
+
+// P2PDownloadStatus is a compact, advisory snapshot used for the room UI.
+// Downloaded media itself never traverses the signaling WebSocket.
+type P2PDownloadStatus struct {
+	State           string  `json:"state"`
+	Progress        float64 `json:"progress"`
+	BytesPerSecond  float64 `json:"bytesPerSecond"`
+	BufferedSeconds float64 `json:"bufferedSeconds"`
+	Downloaded      int     `json:"downloaded"`
+	Total           int     `json:"total"`
 }
 
 // VideoState represents the current state of the video player.
@@ -85,4 +100,5 @@ const (
 	MsgHostNetworkInfo = "host_network_info"
 	MsgP2PChunkOffer   = "p2p_chunk_offer"
 	MsgP2PChunkRequest = "p2p_chunk_request"
+	MsgP2PStatus       = "p2p_download_status"
 )
