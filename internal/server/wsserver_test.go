@@ -192,6 +192,49 @@ func TestMediaAccessTokenProtectsVideo(t *testing.T) {
 	}
 }
 
+func TestHLSAssetsUseSessionVersionAndDisableHTTPCache(t *testing.T) {
+	dir := t.TempDir()
+	playlist := "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg_00000.m4s\n"
+	for name, data := range map[string]string{
+		"index.m3u8":    playlist,
+		"init.mp4":      "init",
+		"seg_00000.m4s": "segment",
+	} {
+		if err := os.WriteFile(dir+"/"+name, []byte(data), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	server := NewWSServer(0)
+	server.SetHLSDir(dir)
+
+	playlistResponse := httptest.NewRecorder()
+	server.handleVideoHLS(playlistResponse, httptest.NewRequest(http.MethodGet, "/video/hls/index.m3u8", nil))
+	if playlistResponse.Code != http.StatusOK {
+		t.Fatalf("expected playlist status 200, got %d", playlistResponse.Code)
+	}
+	if playlistResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected playlist cache prevention, got %q", playlistResponse.Header().Get("Cache-Control"))
+	}
+	body := playlistResponse.Body.String()
+	if !strings.Contains(body, "init.mp4?wt_hls=1") || !strings.Contains(body, "seg_00000.m4s?wt_hls=1") {
+		t.Fatalf("expected session-versioned HLS asset URLs, got %q", body)
+	}
+
+	assetResponse := httptest.NewRecorder()
+	server.handleVideoHLS(assetResponse, httptest.NewRequest(http.MethodGet, "/video/hls/init.mp4?wt_hls=1", nil))
+	if assetResponse.Code != http.StatusOK || assetResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected uncached init segment, status=%d cache=%q", assetResponse.Code, assetResponse.Header().Get("Cache-Control"))
+	}
+
+	server.SetHLSDir(dir)
+	newSession := httptest.NewRecorder()
+	server.handleVideoHLS(newSession, httptest.NewRequest(http.MethodGet, "/video/hls/index.m3u8", nil))
+	if !strings.Contains(newSession.Body.String(), "wt_hls=2") {
+		t.Fatalf("expected HLS asset version to increment, got %q", newSession.Body.String())
+	}
+}
+
 func TestWebSocketRelaysP2PDownloadStatus(t *testing.T) {
 	srv, wsURL := newTestWebSocketServer(t)
 	defer srv.Close()

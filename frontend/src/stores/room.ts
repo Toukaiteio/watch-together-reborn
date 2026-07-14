@@ -66,6 +66,7 @@ export const useRoomStore = defineStore('room', () => {
   let suppressCloseHandling = false
   let probeGeneration = 0
   let magnetSessionSeq = 0
+  let localVideoSessionSeq = 0
   let signalingRelayUrl = ''
   let lastChunkManifestPayload: { path: string; manifest: ChunkManifest } | null = null
   let pendingSecureInvite = ''
@@ -1182,6 +1183,7 @@ export const useRoomStore = defineStore('room', () => {
 
   async function selectLocalVideoFile() {
     if (!isHost.value) return
+    const sessionSeq = ++localVideoSessionSeq
     try {
       await window.go.main.App.StopVideoServe().catch(() => {})
       resetChunkPlaybackState()
@@ -1196,40 +1198,56 @@ export const useRoomStore = defineStore('room', () => {
       const wails = window.go.main.App
       const filePath = await wails.SelectVideoFile()
       if (!filePath) {
-        localFilePreparing.value = false
-        localFileProgress.value = null
+        if (sessionSeq === localVideoSessionSeq) {
+          localFilePreparing.value = false
+          localFileProgress.value = null
+        }
         return
       }
 
       const port = localServerPort.value || serverPort.value || 55511
+      // Do not publish the original file before it is browser-compatible.
+      // All members wait for the host to produce the initial HLS playlist.
       const hlsPath = await wails.ServeVideoFileSegmented(filePath)
-      const localPlaybackUrl = appendMediaAccessToken(buildHttpURL('localhost', port, hlsPath))
+      if (sessionSeq !== localVideoSessionSeq) return
 
+      const localPlaybackUrl = appendMediaAccessToken(buildHttpURL('localhost', port, hlsPath))
       setVideoSource(hlsPath, 'hls')
       setPlaybackOverride(localPlaybackUrl, 'hls')
       localFilePreparing.value = false
 
-      void wails.ServeVideoFileChunked(filePath)
-        .then((manifestPath) => {
+      void (async () => {
+        try {
+          const manifestPath = await wails.ServeVideoFileChunked(filePath)
+          if (sessionSeq !== localVideoSessionSeq) return
+
           attachChunkManifest(manifestPath)
-          return fetch(resolveMediaRef(manifestPath), { cache: 'no-store' })
+          const manifest = await fetch(resolveMediaRef(manifestPath), { cache: 'no-store' })
             .then((response) => {
               if (!response.ok) throw new Error(`manifest ${response.status}`)
               return response.json() as Promise<ChunkManifest>
             })
-            .then((manifest) => broadcastP2PManifest(manifestPath, manifest))
-        })
-        .catch((err: any) => {
-          connectionError.value = 'P2P 分发预处理失败: ' + (err?.message || '未知错误')
-        })
+          if (sessionSeq === localVideoSessionSeq) {
+            broadcastP2PManifest(manifestPath, manifest)
+          }
+        } catch (err: any) {
+          if (sessionSeq === localVideoSessionSeq) {
+            localFilePreparing.value = false
+            console.warn('[room] local video P2P preprocessing failed; keeping HLS playback', err)
+          }
+        }
+      })()
     } catch (err: any) {
-      connectionError.value = err?.message || '无法加载视频文件'
-      localFilePreparing.value = false
+      if (sessionSeq === localVideoSessionSeq) {
+        connectionError.value = '本地视频预处理失败: ' + formatErrorMessage(err, '无法生成可播放的 HLS 视频流')
+        localFilePreparing.value = false
+      }
     }
   }
 
   async function setVideoURL(url: string) {
     if (!isHost.value || !url.trim()) return
+    localVideoSessionSeq++
     await window.go.main.App.StopVideoServe().catch(() => {})
     let sourceType: VideoSourceType = 'url'
     if (url.startsWith('magnet:?')) sourceType = 'magnet'
@@ -1268,6 +1286,7 @@ export const useRoomStore = defineStore('room', () => {
     const hadLocalServer = !!localServerPort.value
     suppressCloseHandling = true
     magnetSessionSeq++
+    localVideoSessionSeq++
 
     if (notifyServer) {
       wsClient.send({ type: 'leave_room' })

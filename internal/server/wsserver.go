@@ -39,6 +39,7 @@ type WSServer struct {
 	videoPath        string
 	chunkMgr         *chunk.ChunkManager
 	hlsDir           string
+	hlsVersion       uint64
 	mediaAccessToken string
 }
 
@@ -143,6 +144,7 @@ func (s *WSServer) SetHLSDir(dir string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hlsDir = dir
+	s.hlsVersion++
 }
 
 func (s *WSServer) ClearHLSDir() {
@@ -200,6 +202,9 @@ func (s *WSServer) handleVideoHLS(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeMedia(w, r) {
 		return
 	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length")
+	w.Header().Set("Cache-Control", "no-store")
 	s.mu.Lock()
 	dir := s.hlsDir
 	s.mu.Unlock()
@@ -219,11 +224,8 @@ func (s *WSServer) handleVideoHLS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length")
 	if filepath.Ext(name) == ".m3u8" {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-store")
 		playlist, readErr := os.ReadFile(path)
 		if readErr != nil {
 			http.Error(w, "HLS playlist unavailable", http.StatusNotFound)
@@ -233,13 +235,10 @@ func (s *WSServer) handleVideoHLS(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if filepath.Ext(name) == ".m4s" {
 		w.Header().Set("Content-Type", "video/iso.segment")
-		w.Header().Set("Cache-Control", "public, max-age=86400")
 	} else if filepath.Ext(name) == ".mp4" {
 		w.Header().Set("Content-Type", "video/mp4")
-		w.Header().Set("Cache-Control", "public, max-age=86400")
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Cache-Control", "public, max-age=86400")
 	}
 	http.ServeFile(w, r, path)
 }
@@ -334,11 +333,12 @@ func (s *WSServer) authorizeMedia(w http.ResponseWriter, r *http.Request) bool {
 func (s *WSServer) addTokenToHLSPlaylist(playlist string) string {
 	s.mu.Lock()
 	token := s.mediaAccessToken
+	version := s.hlsVersion
 	s.mu.Unlock()
-	if token == "" {
-		return playlist
+	query := "wt_hls=" + strconv.FormatUint(version, 10)
+	if token != "" {
+		query = "access_token=" + url.QueryEscape(token) + "&" + query
 	}
-	encoded := "access_token=" + url.QueryEscape(token)
 	lines := strings.Split(playlist, "\n")
 	for index, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -346,7 +346,7 @@ func (s *WSServer) addTokenToHLSPlaylist(playlist string) string {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "#EXT-X-MAP:") {
-			lines[index] = appendTokenToURIAttribute(line, encoded)
+			lines[index] = appendTokenToURIAttribute(line, query)
 			continue
 		}
 		if !strings.HasPrefix(trimmed, "#") {
@@ -354,7 +354,7 @@ func (s *WSServer) addTokenToHLSPlaylist(playlist string) string {
 			if strings.Contains(trimmed, "?") {
 				separator = "&"
 			}
-			lines[index] = line + separator + encoded
+			lines[index] = line + separator + query
 		}
 	}
 	return strings.Join(lines, "\n")

@@ -248,7 +248,7 @@ func (a *App) ServeVideoFileSegmented(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := seg.WaitReady(25 * time.Second); err != nil {
+	if err := seg.WaitReady(90 * time.Second); err != nil {
 		seg.Cleanup()
 		return "", err
 	}

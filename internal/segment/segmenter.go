@@ -40,7 +40,7 @@ func Start(filePath string) (*Segmenter, error) {
 
 	playlistPath := filepath.Join(dir, PlaylistName)
 	segmentPattern := filepath.Join(dir, "seg_%05d.m4s")
-	videoArgs := h264EncoderArgs(ffmpegPath)
+	videoArgs, copyVideo := videoOutputArgs(ffmpegPath, filePath)
 	if len(videoArgs) == 0 {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("no usable H.264 encoder found in ffmpeg")
@@ -54,12 +54,18 @@ func Start(filePath string) (*Segmenter, error) {
 		"-map", "0:a:0?",
 	}
 	args = append(args, videoArgs...)
+	if !copyVideo {
+		args = append(args,
+			"-force_key_frames", "expr:gte(t,n_forced*"+SegmentTime+")",
+			"-sc_threshold", "0",
+			"-pix_fmt", "yuv420p",
+		)
+	}
+	hlsFlags := "temp_file"
+	if !copyVideo {
+		hlsFlags = "independent_segments+temp_file"
+	}
 	args = append(args,
-		"-force_key_frames", "expr:gte(t,n_forced*"+SegmentTime+")",
-		"-sc_threshold", "0",
-		"-profile:v", "main",
-		"-level:v", "3.1",
-		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "128k",
 		"-ac", "2",
@@ -67,7 +73,7 @@ func Start(filePath string) (*Segmenter, error) {
 		"-hls_time", SegmentTime,
 		"-hls_list_size", "0",
 		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+temp_file",
+		"-hls_flags", hlsFlags,
 		"-hls_segment_type", "fmp4",
 		"-hls_fmp4_init_filename", InitName,
 		"-hls_segment_filename", segmentPattern,
@@ -75,6 +81,10 @@ func Start(filePath string) (*Segmenter, error) {
 	)
 
 	cmd := exec.Command(ffmpegPath, args...)
+	// ffmpeg resolves hls_fmp4_init_filename relative to its working
+	// directory, not the playlist path. Keep init.mp4 alongside the playlist
+	// and segments so the HTTP HLS handler can serve every referenced asset.
+	cmd.Dir = dir
 
 	s := &Segmenter{
 		dir:  dir,
@@ -103,6 +113,7 @@ func (s *Segmenter) PlaylistPath() string {
 	return filepath.Join(s.dir, PlaylistName)
 }
 
+// WaitReady returns as soon as the first playable HLS segment is available.
 func (s *Segmenter) WaitReady(timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -165,6 +176,19 @@ func (s *Segmenter) stderrSuffix() string {
 	return ": " + text
 }
 
+func videoOutputArgs(ffmpegPath, filePath string) ([]string, bool) {
+	if sourceHasBrowserCompatibleH264(ffmpegPath, filePath) {
+		return []string{"-c:v", "copy"}, true
+	}
+	return h264EncoderArgs(ffmpegPath), false
+}
+
+func sourceHasBrowserCompatibleH264(ffmpegPath, filePath string) bool {
+	output, _ := exec.Command(ffmpegPath, "-hide_banner", "-i", filePath).CombinedOutput()
+	probe := string(output)
+	return strings.Contains(probe, "Video: h264 ") && strings.Contains(probe, ", yuv420p,")
+}
+
 func h264EncoderArgs(ffmpegPath string) []string {
 	output, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").CombinedOutput()
 	if err != nil {
@@ -173,7 +197,7 @@ func h264EncoderArgs(ffmpegPath string) []string {
 	encoders := string(output)
 	switch {
 	case strings.Contains(encoders, "libx264"):
-		return []string{"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23"}
+		return []string{"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-profile:v", "main", "-level:v", "3.1"}
 	case strings.Contains(encoders, "h264_mf"):
 		return []string{"-c:v", "h264_mf", "-b:v", "2500k"}
 	case strings.Contains(encoders, "h264_nvenc"):
