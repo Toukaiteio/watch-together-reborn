@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useRoomStore } from '@/stores/room'
 import { p2pChunkManager } from '@/composables/useP2PChunk'
-import { Crown, Download, Radio, WifiOff } from 'lucide-vue-next'
+import { CircleAlert, CircleCheck, Crown, Download, LoaderCircle, Radio, WifiOff } from 'lucide-vue-next'
 
 const room = useRoomStore()
 
@@ -31,13 +31,65 @@ const peerColorMap = computed(() => {
   }
   return map
 })
+
+// Depend on the reactive status map so the list re-renders when peer snapshots update.
+const memberStatuses = computed(() => {
+  void room.p2pDownloadStatuses.size
+  const map = new Map<string, ReturnType<typeof room.getMemberPlaybackStatus>>()
+  for (const user of room.users) {
+    // Touch each entry so Vue tracks Map mutations for known members.
+    void room.p2pDownloadStatuses.get(user.id)
+    map.set(user.id, room.getMemberPlaybackStatus(user.id))
+  }
+  return map
+})
+
+const sortedUsers = computed(() =>
+  [...room.users].sort((a, b) => {
+    if (a.isHost !== b.isHost) return a.isHost ? -1 : 1
+    const aPriority = memberStatuses.value.get(a.id)?.priority ?? 4
+    const bPriority = memberStatuses.value.get(b.id)?.priority ?? 4
+    return aPriority - bPriority
+  })
+)
+
+function statusIcon(userId: string) {
+  const state = memberStatuses.value.get(userId)?.state
+  if (state === 'host') return Radio
+  if (state === 'ready') return CircleCheck
+  if (state === 'error') return CircleAlert
+  if (state === 'waiting') return WifiOff
+  if (state === 'buffering') return Download
+  return LoaderCircle
+}
+
+function statusClass(userId: string) {
+  switch (memberStatuses.value.get(userId)?.state) {
+    case 'ready': return 'text-accent'
+    case 'error': return 'text-danger'
+    case 'buffering': return 'text-fg-muted'
+    default: return 'text-fg-subtle'
+  }
+}
+
+function statusLabel(userId: string) {
+  return memberStatuses.value.get(userId)?.label || '等待状态'
+}
+
+function statusDetail(userId: string) {
+  return memberStatuses.value.get(userId)?.detail || ''
+}
+
+function statusState(userId: string) {
+  return memberStatuses.value.get(userId)?.state
+}
 </script>
 
 <template>
   <div class="h-full overflow-y-auto p-4">
     <div class="space-y-1">
       <div
-        v-for="user in room.users"
+        v-for="user in sortedUsers"
         :key="user.id"
         class="flex items-start gap-3 px-2 py-2 rounded transition-fast border-l-2"
         :class="user.id === room.userId ? 'bg-bg-sunken' : 'hover:bg-bg-sunken'"
@@ -61,20 +113,21 @@ const peerColorMap = computed(() => {
             <span v-if="user.id === room.userId" class="text-fg-subtle text-xs shrink-0">（你）</span>
           </div>
           <div class="mt-1 flex min-w-0 items-center gap-1.5 text-2xs text-fg-subtle">
-            <Radio v-if="room.getP2PDownloadStatus(user.id)?.state === 'host'" :size="11" class="text-accent shrink-0" />
-            <Download v-else-if="room.getP2PDownloadStatus(user.id)?.state === 'downloading'" :size="11" class="text-accent shrink-0" />
-            <WifiOff v-else :size="11" class="shrink-0" />
-            <template v-if="room.getP2PDownloadStatus(user.id)?.state === 'host'">
-              <span>房主源已就绪</span>
-            </template>
-            <template v-else-if="room.getP2PDownloadStatus(user.id)?.state === 'downloading' || room.getP2PDownloadStatus(user.id)?.state === 'ready'">
+            <component
+              :is="statusIcon(user.id)"
+              :size="11"
+              class="shrink-0"
+              :class="[statusClass(user.id), statusState(user.id) === 'catching_up' ? 'animate-spin' : '']"
+            />
+            <span :class="statusClass(user.id)">{{ statusLabel(user.id) }}</span>
+            <template v-if="room.getP2PDownloadStatus(user.id)?.state === 'downloading' || room.getP2PDownloadStatus(user.id)?.state === 'ready'">
               <span>{{ Math.round(room.getP2PDownloadStatus(user.id)?.progress || 0) }}%</span>
               <span>·</span>
               <span>{{ formatRate(room.getP2PDownloadStatus(user.id)?.bytesPerSecond || 0) }}</span>
               <span>·</span>
               <span class="truncate">{{ formatBuffer(room.getP2PDownloadStatus(user.id)?.bufferedSeconds || 0) }}</span>
             </template>
-            <span v-else>等待 P2P 分片</span>
+            <span v-else class="truncate">{{ statusDetail(user.id) }}</span>
           </div>
         </div>
 
@@ -89,7 +142,7 @@ const peerColorMap = computed(() => {
       </div>
 
       <div
-        v-if="room.users.length === 0"
+        v-if="sortedUsers.length === 0"
         class="text-center text-sm text-fg-subtle py-8"
       >
         暂无用户

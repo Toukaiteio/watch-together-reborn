@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, watch } from 'vue'
 import type {
-  View, UserInfo, VideoState, WSMessage, VideoSourceType, SidebarTab, ChunkingProgress, IPv6AddrInfo, MagnetStreamStatus, LANRoomInfo, ChunkManifest, RoomPasscode, SecureInvite, P2PDownloadStatus,
+  View, UserInfo, VideoState, WSMessage, VideoSourceType, SidebarTab, ChunkingProgress, IPv6AddrInfo, MagnetStreamStatus, MagnetPlayableFile, LANRoomInfo, ChunkManifest, RoomPasscode, SecureInvite, P2PDownloadStatus, MemberPlaybackStatus, PlaybackReadiness,
 } from '@/types'
 import { wsClient } from '@/composables/useWebSocket'
 import { webrtcManager } from '@/composables/useWebRTC'
@@ -12,6 +12,8 @@ import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { buildHttpURL, buildWsURL, parseHostPortInput } from '@/utils/network'
 import { pickPreferredHost, probeHosts } from '@/utils/hostProbe'
 import { createSecureInvite, isSecureInvite } from '@/utils/secureInvite'
+
+const PLAYABLE_BUFFER_SECONDS = 30
 
 export const useRoomStore = defineStore('room', () => {
   const chatStore = useChatStore()
@@ -47,6 +49,10 @@ export const useRoomStore = defineStore('room', () => {
   const localFileProgress = ref<ChunkingProgress | null>(null)
   const magnetPreparing = ref(false)
   const magnetStatusText = ref('')
+  const magnetFiles = ref<MagnetPlayableFile[]>([])
+  const magnetSelectedFileName = ref('')
+  const autoStartWhenReady = ref(false)
+  const playbackRequest = ref(0)
   const playerFullscreen = ref(false)
   const secureInvite = ref<SecureInvite | null>(null)
   const p2pDownloadStatuses = reactive(new Map<string, P2PDownloadStatus>())
@@ -58,6 +64,156 @@ export const useRoomStore = defineStore('room', () => {
     currentTime: 0,
     speed: 1,
   })
+
+  function getMemberPlaybackStatus(memberID: string): MemberPlaybackStatus {
+    if (!videoState.value.source) {
+      return { state: 'waiting', label: '等待设置视频', detail: '房主尚未选择视频源', priority: 4 }
+    }
+
+    // Direct-play sources (URL / magnet / external stream) never produce a chunk
+    // manifest. Local-file HLS is also playable before P2P chunks are ready.
+    // Treat everyone as ready once a source exists, instead of forever showing
+    // "waiting for video data".
+    if (!videoState.value.chunkManifest) {
+      if (memberID === hostId.value) {
+        if (localFilePreparing.value || magnetPreparing.value) {
+          return {
+            state: 'host',
+            label: '视频源已设置',
+            detail: localFilePreparing.value ? '正在准备可共享的视频数据' : (magnetStatusText.value || '正在准备磁力视频'),
+            priority: 0,
+          }
+        }
+        return { state: 'host', label: '房主源已就绪', detail: '成员可直接播放当前视频源', priority: 0 }
+      }
+      if (memberID === userId.value && (localFilePreparing.value || magnetPreparing.value)) {
+        return {
+          state: 'catching_up',
+          label: magnetPreparing.value ? '磁力缓冲中' : '正在准备播放',
+          detail: magnetStatusText.value || '等待本地播放地址就绪',
+          priority: 3,
+        }
+      }
+      return { state: 'ready', label: '可直接播放', detail: '当前视频源无需等待 P2P 分片', priority: 5 }
+    }
+
+    if (memberID === hostId.value) {
+      return { state: 'host', label: '房主源已就绪', detail: '正在为房间提供视频数据', priority: 0 }
+    }
+
+    const status = getP2PDownloadStatus(memberID)
+    if (!status || status.state === 'idle') {
+      return { state: 'waiting', label: '等待 P2P 分片', detail: '尚未开始建立本地缓存', priority: 4 }
+    }
+    if (status.state === 'error') {
+      return { state: 'error', label: '下载异常', detail: '需要重试或检查网络连接', priority: 1 }
+    }
+    if (status.state === 'host') {
+      // Defensive: non-host entries should not carry host state, but keep UI sane.
+      return { state: 'ready', label: '可流畅播放', detail: '视频数据已准备完成', priority: 5 }
+    }
+    if (status.state === 'ready' || status.bufferedSeconds >= PLAYABLE_BUFFER_SECONDS) {
+      return {
+        state: 'ready',
+        label: '可流畅播放',
+        detail: status.state === 'ready' ? '视频数据已准备完成' : `缓存 ${Math.round(status.bufferedSeconds)} 秒`,
+        priority: 5,
+      }
+    }
+    if (status.bufferedSeconds >= 10) {
+      return {
+        state: 'buffering',
+        label: '缓存偏少',
+        detail: `当前缓存 ${Math.round(status.bufferedSeconds)} 秒，建议继续等待`,
+        priority: 2,
+      }
+    }
+    if (status.downloaded > 0 || status.progress > 0 || status.state === 'downloading') {
+      return {
+        state: 'catching_up',
+        label: '正在追赶进度',
+        detail: status.bufferedSeconds > 0 ? `缓存 ${Math.round(status.bufferedSeconds)} 秒` : '正在获取首批播放片段',
+        priority: 3,
+      }
+    }
+    return { state: 'waiting', label: '缓存建立中', detail: '正在等待可用分片', priority: 4 }
+  }
+
+  const playbackReadiness = computed<PlaybackReadiness>(() => {
+    const totalMembers = users.value.length
+    if (!videoState.value.source) {
+      return {
+        state: 'no_source', label: '尚未设置视频', detail: '选择本地视频、视频链接或磁力链接后即可开始。',
+        recommendation: '请先设置视频源', readyMembers: 0, totalMembers, membersNeedingBuffer: 0,
+      }
+    }
+    if (localFilePreparing.value || magnetPreparing.value) {
+      return {
+        state: 'preparing', label: localFilePreparing.value ? '正在准备视频' : '正在准备磁力视频',
+        detail: localFilePreparing.value
+          ? `本地视频预处理 ${Math.round(localFileProgress.value?.percent || 0)}%`
+          : magnetStatusText.value || '正在获取磁力元数据',
+        recommendation: '等待当前准备步骤完成', readyMembers: 0, totalMembers, membersNeedingBuffer: Math.max(0, totalMembers - 1),
+      }
+    }
+    if (videoState.value.sourceType === 'magnet' && magnetFiles.value.length > 1) {
+      return {
+        state: 'selecting', label: '等待选择视频文件', detail: `此磁力链接有 ${magnetFiles.value.length} 个可播放视频。`,
+        recommendation: isHost.value ? '请选择要播放的视频' : '等待房主选择视频',
+        readyMembers: 0, totalMembers, membersNeedingBuffer: Math.max(0, totalMembers - 1),
+      }
+    }
+    if (!videoState.value.chunkManifest || totalMembers <= 1) {
+      return {
+        state: 'ready', label: '可以开始播放', detail: magnetSelectedFileName.value || '视频源已就绪。',
+        recommendation: '播放过程中会继续建立和补充分片缓存', readyMembers: totalMembers, totalMembers, membersNeedingBuffer: 0,
+      }
+    }
+
+    const nonHostMembers = users.value.filter((member) => !member.isHost)
+    const membersNeedingBuffer = nonHostMembers.filter((member) => getMemberPlaybackStatus(member.id).state !== 'ready').length
+    const readyMembers = totalMembers - membersNeedingBuffer
+    if (membersNeedingBuffer === 0) {
+      return {
+        state: 'ready', label: '所有成员均可流畅播放', detail: `${readyMembers}/${totalMembers} 位成员缓存已达到 ${PLAYABLE_BUFFER_SECONDS} 秒。`,
+        recommendation: '现在开始播放体验最佳', readyMembers, totalMembers, membersNeedingBuffer,
+      }
+    }
+    return {
+      state: 'waiting_for_members', label: `${readyMembers}/${totalMembers} 位成员可流畅播放`,
+      detail: `${membersNeedingBuffer} 位成员仍在建立缓存。`,
+      recommendation: isHost.value ? `建议等待所有成员缓存达到 ${PLAYABLE_BUFFER_SECONDS} 秒后再播放` : '等待房主决定何时开始播放',
+      readyMembers, totalMembers, membersNeedingBuffer,
+    }
+  })
+
+  watch(
+    () => playbackReadiness.value.state,
+    (state) => {
+      if (autoStartWhenReady.value && state === 'ready') {
+        requestPlaybackNow()
+      }
+    },
+  )
+
+  function requestPlaybackNow() {
+    if (!isHost.value || !videoState.value.source) return
+    autoStartWhenReady.value = false
+    playbackRequest.value++
+  }
+
+  function waitForEveryoneThenPlay() {
+    if (!isHost.value || !videoState.value.source) return
+    if (playbackReadiness.value.state === 'ready') {
+      requestPlaybackNow()
+      return
+    }
+    autoStartWhenReady.value = true
+  }
+
+  function cancelAutoStartPlayback() {
+    autoStartWhenReady.value = false
+  }
 
   const danmakuTrigger = ref<{ id: number; text: string; color: string } | null>(null)
   let danmakuSeq = 0
@@ -141,6 +297,28 @@ export const useRoomStore = defineStore('room', () => {
     const status = override || p2pChunkManager.getDownloadStatus()
     setP2PDownloadStatus(userId.value, status)
     wsClient.send({ type: 'p2p_download_status', p2pStatus: status })
+  }
+
+  function republishLocalP2PStatusIfKnown() {
+    if (!userId.value || !videoState.value.chunkManifest) return
+
+    if (isHost.value) {
+      if (lastChunkManifestPayload) {
+        publishLocalP2PStatus({
+          state: 'host',
+          progress: 100,
+          bytesPerSecond: 0,
+          bufferedSeconds: lastChunkManifestPayload.manifest.totalDuration,
+          downloaded: lastChunkManifestPayload.manifest.totalChunks,
+          total: lastChunkManifestPayload.manifest.totalChunks,
+        })
+      }
+      return
+    }
+
+    const localStatus = getP2PDownloadStatus(userId.value) || p2pChunkManager.getDownloadStatus()
+    if (!localStatus || localStatus.state === 'idle') return
+    publishLocalP2PStatus(localStatus)
   }
 
   function startP2PStatusReporter() {
@@ -260,6 +438,8 @@ export const useRoomStore = defineStore('room', () => {
   function resetMagnetState() {
     magnetPreparing.value = false
     magnetStatusText.value = ''
+    magnetFiles.value = []
+    magnetSelectedFileName.value = ''
   }
 
   function formatErrorMessage(err: any, fallback = '未知错误') {
@@ -294,6 +474,50 @@ export const useRoomStore = defineStore('room', () => {
     return `${base} · peer ${stats.activePeers}/${stats.totalPeers} · 连接 ${stats.peerConns} · 已读 ${formatBytes(stats.bytesReadUsefulData)}`
   }
 
+  function addSystemMessage(text: string) {
+    chatStore.addMessage({
+      userId: 'system',
+      username: '系统',
+      text,
+      timestamp: Date.now(),
+      isSystem: true,
+    })
+  }
+
+  function displayVideoSource(source: string, sourceType: VideoSourceType) {
+    if (sourceType === 'magnet') {
+      try {
+        return new URL(source).searchParams.get('dn') || '磁力视频'
+      } catch {
+        return '磁力视频'
+      }
+    }
+    const path = source.split('?')[0].replace(/\\/g, '/')
+    const name = path.split('/').pop() || '视频'
+    try {
+      return decodeURIComponent(name)
+    } catch {
+      return name
+    }
+  }
+
+  function requestedMagnetFileIndex(magnetURI: string) {
+    try {
+      const value = new URL(magnetURI).searchParams.get('wt_file_index')
+      if (value === null) return null
+      const index = Number(value)
+      return Number.isInteger(index) && index >= 0 ? index : null
+    } catch {
+      return null
+    }
+  }
+
+  function withMagnetFileIndex(magnetURI: string, index: number) {
+    const url = new URL(magnetURI)
+    url.searchParams.set('wt_file_index', String(index))
+    return url.toString()
+  }
+
   function shouldPreferP2PPlayback() {
     return !isHost.value &&
       videoState.value.sourceType === 'hls' &&
@@ -309,6 +533,7 @@ export const useRoomStore = defineStore('room', () => {
     clearPlaybackOverride()
     magnetPreparing.value = true
     magnetStatusText.value = '正在启动磁力下载器'
+    magnetFiles.value = []
     connectionError.value = null
 
     try {
@@ -335,9 +560,22 @@ export const useRoomStore = defineStore('room', () => {
         if (sessionSeq !== magnetSessionSeq) return
 
         if (payload) {
+          if (payload.playableFiles) {
+            magnetFiles.value = payload.playableFiles
+          }
+          if (payload.state === 'selecting_file' && requestedMagnetFileIndex(trimmed) === null) {
+            magnetPreparing.value = false
+            magnetStatusText.value = payload.statusText || '请选择要播放的视频'
+            return
+          }
           if (payload.ready) {
             setPlaybackOverride(playbackUrl, 'url')
             magnetPreparing.value = false
+            magnetFiles.value = []
+            magnetSelectedFileName.value = payload.stream?.fileName || ''
+            if (requestedMagnetFileIndex(trimmed) !== null && payload.stream?.fileName) {
+              addSystemMessage(`已选择播放：${payload.stream.fileName}`)
+            }
             magnetStatusText.value = payload.stream?.fileName
               ? `已就绪: ${payload.stream.fileName}`
               : '磁力视频已就绪'
@@ -363,11 +601,30 @@ export const useRoomStore = defineStore('room', () => {
     }
   }
 
+  function selectMagnetFile(index: number) {
+    if (!isHost.value || videoState.value.sourceType !== 'magnet' || index < 0) return
+    const selectedMagnet = withMagnetFileIndex(videoState.value.source, index)
+    setVideoSource(selectedMagnet, 'magnet')
+    void startMagnetPlayback(selectedMagnet)
+  }
+
+  async function retryCurrentVideo() {
+    connectionError.value = null
+    if (videoState.value.sourceType === 'magnet' && videoState.value.source) {
+      await startMagnetPlayback(videoState.value.source)
+    }
+  }
+
+  function dismissConnectionError() {
+    connectionError.value = null
+  }
+
   function resetChunkPlaybackState() {
     stopP2PStatusReporter(false)
     p2pChunkManager.destroy()
     clearPlaybackOverride()
     resetMagnetState()
+    autoStartWhenReady.value = false
     videoState.value.chunkManifest = undefined
     p2pDownloadStatuses.clear()
   }
@@ -537,6 +794,7 @@ export const useRoomStore = defineStore('room', () => {
     }
     lastAppliedSource = canonicalizeMediaRef(msg.source || '')
     view.value = 'room'
+    addSystemMessage('已加入房间，正在与房主同步播放状态。')
     refreshHostCandidates(hostCandidates.value.length > 0 ? hostCandidates.value : [hostIp.value], hostIp.value)
     if (videoState.value.sourceType === 'magnet' && videoState.value.source) {
       void startMagnetPlayback(videoState.value.source)
@@ -557,6 +815,7 @@ export const useRoomStore = defineStore('room', () => {
     p2pDownloadStatuses.set(msg.userId!, {
       state: 'idle', progress: 0, bytesPerSecond: 0, bufferedSeconds: 0, downloaded: 0, total: 0,
     })
+    addSystemMessage(`${msg.username || '一位成员'} 加入了房间`)
     // All existing members initiate WebRTC with the newcomer (not just host),
     // forming a full-mesh topology. The newcomer only responds to offers.
     initiateWebRTC(msg.userId!)
@@ -564,12 +823,17 @@ export const useRoomStore = defineStore('room', () => {
       broadcastHostNetworkInfo()
       rebroadcastP2PManifest()
     }
+    // Members who already finished downloading stop the periodic reporter.
+    // Without an immediate resync, late joiners permanently see them as idle.
+    republishLocalP2PStatusIfKnown()
   }
 
   function handleUserLeft(msg: WSMessage) {
+    const departingUser = users.value.find((user) => user.id === msg.userId)
     users.value = users.value.filter(u => u.id !== msg.userId)
     p2pDownloadStatuses.delete(msg.userId!)
     webrtcManager.closePeer(msg.userId!)
+    if (departingUser) addSystemMessage(`${departingUser.name} 离开了房间`)
   }
 
   function handleHostChanged(msg: WSMessage) {
@@ -577,6 +841,8 @@ export const useRoomStore = defineStore('room', () => {
     users.value = msg.users || []
     isHost.value = msg.hostId === userId.value
     if (isHost.value) wasHost = true
+    const nextHost = users.value.find((user) => user.id === msg.hostId)
+    if (nextHost) addSystemMessage(`${nextHost.name} 现在是房主`)
   }
 
   function handleHostNetworkInfo(msg: WSMessage) {
@@ -622,6 +888,7 @@ export const useRoomStore = defineStore('room', () => {
 
     lastAppliedSource = canonicalSource
     applyVideoSource(canonicalSource, (msg.sourceType as VideoSourceType) || 'url', canonicalManifest)
+    addSystemMessage(`房主切换了视频：${displayVideoSource(canonicalSource, (msg.sourceType as VideoSourceType) || 'url')}`)
 
     if (((msg.sourceType as VideoSourceType) || 'url') === 'magnet' && canonicalSource) {
       void startMagnetPlayback(canonicalSource)
@@ -1127,8 +1394,10 @@ export const useRoomStore = defineStore('room', () => {
 
     lastAppliedSource = canonicalSource
     applyVideoSource(canonicalSource, sourceType, canonicalManifest)
+    addSystemMessage(`已切换视频：${displayVideoSource(canonicalSource, sourceType)}`)
     videoState.value.playing = false
     videoState.value.currentTime = 0
+    autoStartWhenReady.value = false
 
     const msg: WSMessage = { type: 'video_source', source: canonicalSource, sourceType, chunkManifest: canonicalManifest }
     webrtcManager.broadcast(JSON.stringify(msg))
@@ -1318,6 +1587,7 @@ export const useRoomStore = defineStore('room', () => {
     }
     localFilePreparing.value = false
     localFileProgress.value = null
+    autoStartWhenReady.value = false
     resetMagnetState()
     wsConnected.value = false
     webrtcConnected.value = false
@@ -1356,13 +1626,13 @@ export const useRoomStore = defineStore('room', () => {
     roomId, userId, hostId, users, passcodes, localIPs, localIPv6s, ipv6Addresses, hostCandidates,
     lanRooms, lanDiscovering,
     preferredShareIp,
-    localFilePreparing, localFileProgress, magnetPreparing, magnetStatusText, secureInvite, p2pDownloadStatuses,
+    localFilePreparing, localFileProgress, magnetPreparing, magnetStatusText, magnetFiles, magnetSelectedFileName, autoStartWhenReady, playbackRequest, secureInvite, p2pDownloadStatuses,
     videoState, danmakuTrigger, playerFullscreen,
-    currentUser, userCount,
+    currentUser, userCount, playbackReadiness,
     init, createRoom, createRoomViaSignalingRelay, joinRoomByPasscode, joinRoomByIP, joinRoomViaSignalingRelay,
     discoverLANRooms, joinLANRoom,
-    leaveRoom, setVideoSource, setVideoURL, selectLocalVideoFile, getP2PDownloadStatus,
-    sendVideoPlay, sendVideoSeek, sendVideoSpeed, sendChat,
-    setPreferredShareIp, setPlayerFullscreen, resolveMediaRef, clearPlaybackOverride,
+    leaveRoom, setVideoSource, setVideoURL, selectLocalVideoFile, selectMagnetFile, getP2PDownloadStatus, getMemberPlaybackStatus,
+    sendVideoPlay, sendVideoSeek, sendVideoSpeed, sendChat, requestPlaybackNow, waitForEveryoneThenPlay, cancelAutoStartPlayback,
+    setPreferredShareIp, setPlayerFullscreen, resolveMediaRef, clearPlaybackOverride, retryCurrentVideo, dismissConnectionError,
   }
 })

@@ -5,6 +5,7 @@ import { useRoomStore } from '@/stores/room'
 import { p2pChunkManager } from '@/composables/useP2PChunk'
 import { WindowFullscreen, WindowUnfullscreen, WindowIsFullscreen } from '../../wailsjs/runtime/runtime'
 import { Monitor, Upload, Loader2, Gauge } from 'lucide-vue-next'
+import MagnetFileSelector from './MagnetFileSelector.vue'
 
 const room = useRoomStore()
 const containerRef = ref<HTMLDivElement>()
@@ -17,6 +18,7 @@ let remoteGuardUntil = 0
 let lastMemberNoticeAt = 0
 let lastChunkSyncAt = 0
 let fullscreenSyncTimers: ReturnType<typeof setTimeout>[] = []
+let removeMemberHotkeyBlocker: (() => void) | null = null
 
 const hasSource = computed(() =>
   room.videoState.sourceType === 'magnet'
@@ -307,6 +309,9 @@ function bindMemberRestrictions() {
   const playButton = containerRef.value.querySelector('.dplayer-play-icon') as HTMLButtonElement | null
   const mobilePlayButton = containerRef.value.querySelector('.dplayer-mobile-play') as HTMLButtonElement | null
   const barWrap = containerRef.value.querySelector('.dplayer-bar-wrap') as HTMLElement | null
+  const videoWrap = containerRef.value.querySelector('.dplayer-video-wrap') as HTMLElement | null
+  const bezel = containerRef.value.querySelector('.dplayer-bezel') as HTMLElement | null
+  const speedSetting = containerRef.value.querySelector('.dplayer-setting-speed') as HTMLElement | null
   const speedItems = containerRef.value.querySelectorAll('.dplayer-setting-speed-item')
 
   const stopEvent = (event: Event) => {
@@ -315,11 +320,45 @@ function bindMemberRestrictions() {
     showMemberNotice('只有房主可以控制播放进度', 1500)
   }
 
-  playButton?.addEventListener('click', stopEvent, true)
-  mobilePlayButton?.addEventListener('click', stopEvent, true)
+  const markLocked = (element: HTMLElement | null, message: string) => {
+    if (!element) return
+    element.classList.add('wt-member-control-locked')
+    element.setAttribute('aria-disabled', 'true')
+    element.setAttribute('title', message)
+  }
+
+  markLocked(playButton, '跟随房主播放：房主控制播放和暂停')
+  markLocked(mobilePlayButton, '跟随房主播放：房主控制播放和暂停')
+  markLocked(barWrap, '跟随房主播放：房主控制进度')
+  markLocked(videoWrap, '跟随房主播放：房主控制播放和暂停')
+  markLocked(bezel, '跟随房主播放：房主控制播放和暂停')
+  markLocked(speedSetting, '跟随房主播放：房主控制播放速度')
+  speedItems.forEach((item) => markLocked(item as HTMLElement, '跟随房主播放：房主控制播放速度'))
+
+  const stopPlayEvent = (event: Event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    showMemberNotice('跟随房主播放；音量和全屏仍可自行调整', 1800)
+  }
+
+  playButton?.addEventListener('click', stopPlayEvent, true)
+  mobilePlayButton?.addEventListener('click', stopPlayEvent, true)
+  videoWrap?.addEventListener('click', stopPlayEvent, true)
+  bezel?.addEventListener('click', stopPlayEvent, true)
   barWrap?.addEventListener('mousedown', stopEvent, true)
   barWrap?.addEventListener('click', stopEvent, true)
+  speedSetting?.addEventListener('click', stopEvent, true)
   speedItems.forEach((item) => item.addEventListener('click', stopEvent, true))
+
+  const blockMemberHotkeys = (event: KeyboardEvent) => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
+    if (event.key !== ' ' && event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+    event.preventDefault()
+    event.stopPropagation()
+    showMemberNotice('跟随房主播放；进度由房主统一控制', 1500)
+  }
+  document.addEventListener('keydown', blockMemberHotkeys, true)
+  removeMemberHotkeyBlocker = () => document.removeEventListener('keydown', blockMemberHotkeys, true)
 }
 
 function showMemberPlaybackBadge() {
@@ -417,6 +456,8 @@ function beginRemoteGuard(durationMs = 300) {
   if (remoteGuardTimer) {
     clearTimeout(remoteGuardTimer)
   }
+  removeMemberHotkeyBlocker?.()
+  removeMemberHotkeyBlocker = null
   remoteGuardTimer = setTimeout(() => {
     if (performance.now() >= remoteGuardUntil) {
       applyingRemote = false
@@ -563,6 +604,14 @@ watch(() => room.videoState.playing, (playing) => {
   }
 })
 
+// Requests from the room readiness panel are deliberately handled by the
+// active player instance, so the normal DPlayer event path still broadcasts
+// the play state to every member.
+watch(() => room.playbackRequest, () => {
+  if (!room.isHost || !dp) return
+  dp.play().catch(() => {})
+})
+
 // Watch currentTime (members follow host seek)
 watch(() => room.videoState.currentTime, (time) => {
   if (room.isHost || !dp) return
@@ -648,9 +697,17 @@ onBeforeUnmount(() => {
         {{
           room.magnetPreparing
             ? (room.magnetStatusText || '正在获取磁力元数据')
-            : room.isHost ? '请在右侧管理面板设置视频源' : '等待房主设置视频源'
+            : room.videoState.sourceType === 'magnet' && room.magnetFiles.length > 1
+              ? (room.isHost ? '请选择要播放的视频' : '等待房主选择要播放的视频')
+              : room.isHost ? '请在右侧管理面板设置视频源' : '等待房主设置视频源'
         }}
       </p>
+      <MagnetFileSelector
+        v-if="room.videoState.sourceType === 'magnet' && room.magnetFiles.length > 1"
+        :files="room.magnetFiles"
+        :disabled="!room.isHost"
+        @select="room.selectMagnetFile"
+      />
       <button
         v-if="room.isHost"
         class="btn-ghost"
@@ -757,6 +814,21 @@ onBeforeUnmount(() => {
 :deep(.wt-member-badge-lock),
 :deep(.wt-member-badge-volume) {
   white-space: nowrap;
+}
+
+:deep(.wt-member-control-locked) {
+  cursor: not-allowed !important;
+  opacity: 0.48;
+}
+
+:deep(.dplayer-bar-wrap.wt-member-control-locked),
+:deep(.dplayer-setting-speed.wt-member-control-locked) {
+  filter: grayscale(0.75);
+}
+
+:deep(.dplayer-video-wrap.wt-member-control-locked),
+:deep(.dplayer-bezel.wt-member-control-locked) {
+  cursor: default;
 }
 
  :deep(.dplayer-mask) {

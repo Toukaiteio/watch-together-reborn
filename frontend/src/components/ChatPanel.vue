@@ -49,22 +49,27 @@ watch(
         v-for="msg in chat.messages"
         :key="msg.timestamp + msg.userId"
         class="flex flex-col gap-0.5"
-        :class="msg.isSelf ? 'items-end' : 'items-start'"
+        :class="msg.isSystem ? 'items-center py-1' : (msg.isSelf ? 'items-end' : 'items-start')"
       >
-        <div class="flex items-center gap-2 text-2xs text-fg-subtle">
-          <span :class="msg.isSelf ? 'text-fg-subtle' : 'text-fg-muted font-medium'">
-            {{ msg.isSelf ? '我' : msg.username }}
-          </span>
-          <span>{{ formatTime(msg.timestamp) }}</span>
-        </div>
-        <div
-          class="text-sm px-3 py-1.5 rounded max-w-[85%] break-words"
-          :class="msg.isSelf
-            ? 'bg-accent text-fg-onAccent'
-            : 'bg-bg-sunken text-fg'"
-        >
-          {{ msg.text }}
-        </div>
+        <template v-if="msg.isSystem">
+          <span class="max-w-[92%] text-center text-2xs leading-5 text-fg-subtle">{{ msg.text }}</span>
+        </template>
+        <template v-else>
+          <div class="flex items-center gap-2 text-2xs text-fg-subtle">
+            <span :class="msg.isSelf ? 'text-fg-subtle' : 'text-fg-muted font-medium'">
+              {{ msg.isSelf ? '我' : msg.username }}
+            </span>
+            <span>{{ formatTime(msg.timestamp) }}</span>
+          </div>
+          <div
+            class="text-sm px-3 py-1.5 rounded max-w-[85%] break-words"
+            :class="msg.isSelf
+              ? 'bg-accent text-fg-onAccent'
+              : 'bg-bg-sunken text-fg'"
+          >
+            {{ msg.text }}
+          </div>
+        </template>
       </div>
     </div>
 

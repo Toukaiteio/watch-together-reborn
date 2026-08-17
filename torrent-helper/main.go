@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +73,13 @@ type status struct {
 	PeerStats      stats   `json:"peerStats"`
 }
 
+type playableFile struct {
+	Index     int    `json:"index"`
+	FileName  string `json:"fileName"`
+	FileSize  int64  `json:"fileSize"`
+	Extension string `json:"extension"`
+}
+
 type stats struct {
 	TotalPeers          int   `json:"totalPeers"`
 	PendingPeers        int   `json:"pendingPeers"`
@@ -94,6 +102,8 @@ type helperState struct {
 	statusText string
 	ready      bool
 	magnetURI  string
+	files      []playableFile
+	fileIndex  int
 }
 
 func main() {
@@ -112,6 +122,7 @@ func main() {
 		state:      "starting",
 		statusText: "正在初始化磁力下载器",
 		magnetURI:  magnetURI,
+		fileIndex:  -1,
 	}
 
 	mux := http.NewServeMux()
@@ -222,17 +233,14 @@ func startSession(magnetURI string) (*session, error) {
 		upload:    uploadLimiter,
 		stopRate:  make(chan struct{}),
 	}
-	if err := sess.waitAndSelectFile(metadataTimeout); err != nil {
-		sess.cleanup()
-		return nil, err
-	}
 	go sess.adjustUploadLimit()
 	return sess, nil
 }
 
 func (s *helperState) prepare(magnetURI string) {
 	s.setState("fetching_metadata", "正在获取磁力元数据", "")
-	sess, err := startSession(magnetURI)
+	streamMagnet, requestedFileIndex := extractSelectedFileIndex(magnetURI)
+	sess, err := startSession(streamMagnet)
 	if err != nil {
 		s.setState("error", "", err.Error())
 		return
@@ -240,11 +248,37 @@ func (s *helperState) prepare(magnetURI string) {
 
 	s.mu.Lock()
 	s.session = sess
-	s.ready = true
-	s.state = "ready"
-	s.errMessage = ""
-	s.statusText = "磁力元数据已就绪，正在边下边播"
 	s.mu.Unlock()
+
+	files, err := sess.waitForPlayableFiles(metadataTimeout)
+	if err != nil {
+		sess.cleanup()
+		s.mu.Lock()
+		if s.session == sess {
+			s.session = nil
+		}
+		s.mu.Unlock()
+		s.setState("error", "", err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.files = files
+	s.mu.Unlock()
+
+	if requestedFileIndex != nil {
+		if err := s.selectFile(*requestedFileIndex); err != nil {
+			s.setState("error", "", err.Error())
+		}
+		return
+	}
+	if len(files) == 1 {
+		if err := s.selectFile(files[0].Index); err != nil {
+			s.setState("error", "", err.Error())
+		}
+		return
+	}
+	s.setState("selecting_file", fmt.Sprintf("发现 %d 个可播放视频，请选择", len(files)), "")
 }
 
 func (s *helperState) getStatus() map[string]any {
@@ -252,16 +286,52 @@ func (s *helperState) getStatus() map[string]any {
 	defer s.mu.RUnlock()
 
 	result := map[string]any{
-		"state":      s.state,
-		"ready":      s.ready,
-		"error":      s.errMessage,
-		"statusText": s.statusText,
-		"magnetUri":  s.magnetURI,
+		"state":             s.state,
+		"ready":             s.ready,
+		"error":             s.errMessage,
+		"statusText":        s.statusText,
+		"magnetUri":         s.magnetURI,
+		"playableFiles":     s.files,
+		"selectedFileIndex": s.fileIndex,
 	}
 	if s.session != nil {
 		result["stream"] = s.session.getStatus()
 	}
 	return result
+}
+
+func (s *helperState) selectFile(index int) error {
+	s.mu.RLock()
+	sess := s.session
+	files := s.files
+	s.mu.RUnlock()
+	if sess == nil {
+		return fmt.Errorf("magnet metadata is not ready")
+	}
+	if !containsPlayableFile(files, index) {
+		return fmt.Errorf("playable file index %d was not found", index)
+	}
+	if err := sess.selectFile(index); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.fileIndex = index
+	s.ready = true
+	s.state = "ready"
+	s.errMessage = ""
+	s.statusText = "已选择视频，正在边下边播"
+	s.mu.Unlock()
+	return nil
+}
+
+func containsPlayableFile(files []playableFile, index int) bool {
+	for _, file := range files {
+		if file.Index == index {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *helperState) setState(state string, statusText string, errMessage string) {
@@ -302,17 +372,26 @@ func (s *helperState) cleanup() {
 	}
 }
 
-func (s *session) waitAndSelectFile(timeout time.Duration) error {
+func (s *session) waitForPlayableFiles(timeout time.Duration) ([]playableFile, error) {
 	select {
 	case <-s.tor.GotInfo():
 	case <-time.After(timeout):
-		return fmt.Errorf("timed out waiting for magnet metadata")
+		return nil, fmt.Errorf("timed out waiting for magnet metadata")
 	}
 
-	file := selectLargestVideoFile(s.tor.Files())
-	if file == nil {
-		return fmt.Errorf("no playable video file found in torrent")
+	files := listPlayableVideoFiles(s.tor.Files())
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no playable video file found in torrent; found file extensions: %s", describeFileExtensions(s.tor.Files()))
 	}
+	return files, nil
+}
+
+func (s *session) selectFile(index int) error {
+	files := s.tor.Files()
+	if index < 0 || index >= len(files) || files[index] == nil || !isSupportedVideoPath(files[index].DisplayPath()) {
+		return fmt.Errorf("playable file index %d was not found", index)
+	}
+	file := files[index]
 	if err := ensureEnoughDiskSpace(s.dataDir, file.Length()); err != nil {
 		return err
 	}
@@ -571,23 +650,46 @@ func (s *session) cleanup() {
 	})
 }
 
-func selectLargestVideoFile(files []*torrent.File) *torrent.File {
-	var best *torrent.File
-	for _, file := range files {
+func listPlayableVideoFiles(files []*torrent.File) []playableFile {
+	result := make([]playableFile, 0)
+	for index, file := range files {
 		if file == nil {
 			continue
 		}
 		if !isSupportedVideoPath(file.DisplayPath()) {
 			continue
 		}
-		if best == nil || file.Length() > best.Length() {
-			best = file
+		result = append(result, playableFile{
+			Index:     index,
+			FileName:  filepath.Base(file.DisplayPath()),
+			FileSize:  file.Length(),
+			Extension: strings.ToLower(filepath.Ext(file.DisplayPath())),
+		})
+	}
+	return result
+}
+
+func describeFileExtensions(files []*torrent.File) string {
+	extensions := make(map[string]struct{})
+	for _, file := range files {
+		if file == nil {
+			continue
 		}
+		extension := strings.ToLower(filepath.Ext(file.DisplayPath()))
+		if extension == "" {
+			extension = "(no extension)"
+		}
+		extensions[extension] = struct{}{}
 	}
-	if best != nil {
-		return best
+	if len(extensions) == 0 {
+		return "(no files)"
 	}
-	return nil
+	result := make([]string, 0, len(extensions))
+	for extension := range extensions {
+		result = append(result, extension)
+	}
+	sort.Strings(result)
+	return strings.Join(result, ", ")
 }
 
 func isSupportedVideoPath(path string) bool {
@@ -613,6 +715,25 @@ func normalizeMagnetURI(raw string) string {
 	}
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
+}
+
+func extractSelectedFileIndex(raw string) (string, *int) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "magnet") {
+		return raw, nil
+	}
+	query := parsed.Query()
+	value := query.Get("wt_file_index")
+	query.Del("wt_file_index")
+	parsed.RawQuery = query.Encode()
+	if value == "" {
+		return parsed.String(), nil
+	}
+	index, err := strconv.Atoi(value)
+	if err != nil || index < 0 {
+		return parsed.String(), nil
+	}
+	return parsed.String(), &index
 }
 
 func parseByteRange(header string, fileSize int64) (start int64, end int64, partial bool, err error) {

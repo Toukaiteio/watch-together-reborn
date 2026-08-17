@@ -7,6 +7,7 @@ import {
   Key,
   Globe,
   AlertCircle,
+  Clipboard,
   Loader2,
   ChevronDown,
   ShieldCheck,
@@ -24,6 +25,7 @@ const displayName = ref(settings.username || '')
 const primaryMode = ref<'create' | 'join'>('create')
 const joinMode = ref<'passcode' | 'ip' | 'lan' | 'relay'>('passcode')
 const passcodeInput = ref('')
+const passcodePasteMessage = ref('')
 const ipInput = ref('')
 const showJoinAdvanced = ref(false)
 const showAdvanced = ref(false)
@@ -86,6 +88,29 @@ function setJoinMode(mode: 'passcode' | 'ip' | 'lan' | 'relay') {
   joinMode.value = mode
   if (mode !== 'passcode') {
     showJoinAdvanced.value = true
+  }
+}
+
+function setPrimaryMode(mode: 'create' | 'join') {
+  primaryMode.value = mode
+  passcodePasteMessage.value = ''
+  if (mode === 'create') {
+    showJoinAdvanced.value = false
+  }
+}
+
+async function pastePasscode() {
+  try {
+    const value = (await navigator.clipboard.readText()).trim()
+    if (!value) {
+      passcodePasteMessage.value = '剪贴板中没有可用口令。'
+      return
+    }
+    passcodeInput.value = value
+    joinMode.value = 'passcode'
+    passcodePasteMessage.value = '已从剪贴板填入口令。'
+  } catch {
+    passcodePasteMessage.value = '无法读取剪贴板，请手动粘贴口令。'
   }
 }
 
@@ -161,7 +186,7 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  [primaryMode, showJoinAdvanced, joinMode, () => room.lanRooms.length, () => room.lanDiscovering],
+  [primaryMode, showJoinAdvanced, joinMode, () => room.lanRooms.length, () => room.lanDiscovering, passcodePasteMessage],
   async () => {
     await nextTick()
     syncFlowBodyHeight()
@@ -192,7 +217,7 @@ const flowBodyShellStyle = computed(() =>
               Watch Together
             </h1>
             <p class="home-brand__slogan mt-5 max-w-lg text-fg-muted">
-              和朋友开一个同步房间。房主创建后分享口令，其他人输入口令就能马上加入。
+              创建房间，复制连接口令，和朋友同步观看。加入时只需粘贴房主分享的口令。
             </p>
           </div>
       </section>
@@ -222,7 +247,7 @@ const flowBodyShellStyle = computed(() =>
                 :class="primaryMode === 'create'
                   ? 'home-mode-tab--active'
                   : 'text-fg-muted hover:text-fg'"
-                @click="primaryMode = 'create'"
+                @click="setPrimaryMode('create')"
               >
                 我要开房
               </button>
@@ -231,7 +256,7 @@ const flowBodyShellStyle = computed(() =>
                 :class="primaryMode === 'join'
                   ? 'home-mode-tab--active'
                   : 'text-fg-muted hover:text-fg'"
-                @click="primaryMode = 'join'"
+                @click="setPrimaryMode('join')"
               >
                 我要加入
               </button>
@@ -244,9 +269,9 @@ const flowBodyShellStyle = computed(() =>
               <div ref="flowBodyContentRef" class="home-flow__body">
               <div v-if="primaryMode === 'create'" class="space-y-5">
                 <div>
-                  <div class="text-sm font-semibold text-fg">标准创建</div>
+                  <div class="text-sm font-semibold text-fg">创建一个私密房间</div>
                   <p class="mt-2 text-sm leading-6 text-fg-muted">
-                    程序会在本机创建房间，并给你生成可直接分享的口令。
+                    创建后会生成可直接复制的连接口令。把它发给朋友，对方粘贴即可加入。
                   </p>
                   <button
                     class="btn mt-5 h-12 w-full text-base"
@@ -254,7 +279,7 @@ const flowBodyShellStyle = computed(() =>
                     @click="handleCreate"
                   >
                     <Loader2 v-if="room.isConnecting" :size="18" class="animate-spin" />
-                    <span>创建房间</span>
+                    <span>创建并获取口令</span>
                     <ArrowRight :size="18" />
                   </button>
                 </div>
@@ -266,24 +291,31 @@ const flowBodyShellStyle = computed(() =>
                     <Key :size="16" />
                     口令加入
                   </div>
-                  <p class="mt-2 text-sm leading-6 text-fg-muted">
-                    房主把口令发给你时，直接填这里即可。
-                  </p>
-                  <input
-                    v-model="passcodeInput"
-                    type="text"
-                    placeholder="输入房主分享的口令"
-                    class="input mt-4 px-4 font-mono tracking-wider"
-                    @focus="setJoinMode('passcode')"
-                    @keyup.enter="handleJoin"
-                  />
+                   <p class="mt-2 text-sm leading-6 text-fg-muted">
+                     房主发来连接口令后，粘贴到这里即可加入，无需填写 IP 或端口。
+                   </p>
+                   <div class="mt-4 flex gap-2">
+                     <input
+                       v-model="passcodeInput"
+                       type="text"
+                       placeholder="粘贴房主分享的连接口令"
+                       class="input min-w-0 flex-1 px-4 font-mono tracking-wider"
+                       @focus="setJoinMode('passcode')"
+                       @keyup.enter="handleJoin"
+                     />
+                     <button class="btn-outline shrink-0 px-3" title="从剪贴板粘贴连接口令" @click="pastePasscode">
+                       <Clipboard :size="16" />
+                       <span class="hidden sm:inline">粘贴</span>
+                     </button>
+                   </div>
+                   <p v-if="passcodePasteMessage" class="mt-2 text-xs text-fg-subtle">{{ passcodePasteMessage }}</p>
                   <button
                     class="btn mt-4 h-12 w-full text-base"
                     :disabled="!(trimmedName && passcodeInput.trim()) || room.isConnecting"
                     @click="setJoinMode('passcode'); handleJoin()"
                   >
                     <Loader2 v-if="room.isConnecting && joinMode === 'passcode'" :size="18" class="animate-spin" />
-                    <span>加入房间</span>
+                     <span>使用口令加入</span>
                     <ArrowRight :size="18" />
                   </button>
                 </div>
@@ -296,7 +328,7 @@ const flowBodyShellStyle = computed(() =>
                     <div>
                       <div class="text-sm font-medium text-fg">更多加入方式</div>
                       <div class="mt-1 text-xs text-fg-subtle">
-                        局域网扫描、直接 IP 或信令中继
+                         同网扫描、直接地址或手动中继
                       </div>
                     </div>
                     <ChevronDown

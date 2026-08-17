@@ -37,12 +37,35 @@ export interface P2PDownloadStatus {
   total: number
 }
 
+export type MemberPlaybackState = 'ready' | 'buffering' | 'catching_up' | 'waiting' | 'error' | 'host'
+
+export interface MemberPlaybackStatus {
+  state: MemberPlaybackState
+  label: string
+  detail: string
+  priority: number
+}
+
+export type PlaybackReadinessState = 'no_source' | 'preparing' | 'selecting' | 'waiting_for_members' | 'ready'
+
+export interface PlaybackReadiness {
+  state: PlaybackReadinessState
+  label: string
+  detail: string
+  recommendation: string
+  readyMembers: number
+  totalMembers: number
+  membersNeedingBuffer: number
+}
+
 export interface MagnetStreamStatus {
-  state: 'starting' | 'fetching_metadata' | 'buffering_initial' | 'ready' | 'error'
+  state: 'starting' | 'fetching_metadata' | 'selecting_file' | 'buffering_initial' | 'ready' | 'error'
   ready: boolean
   error?: string
   statusText?: string
   magnetUri?: string
+  playableFiles?: MagnetPlayableFile[]
+  selectedFileIndex?: number
   stream?: {
     magnetUri: string
     fileName: string
@@ -52,6 +75,13 @@ export interface MagnetStreamStatus {
     ready: boolean
     peerStats?: MagnetPeerStats
   }
+}
+
+export interface MagnetPlayableFile {
+  index: number
+  fileName: string
+  fileSize: number
+  extension: string
 }
 
 export interface MagnetPeerStats {
@@ -76,6 +106,7 @@ export interface ChatMessage {
   text: string
   timestamp: number
   isSelf?: boolean
+  isSystem?: boolean
 }
 
 export interface ConnectionInfo {

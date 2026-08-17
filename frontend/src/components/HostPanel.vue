@@ -4,6 +4,7 @@ import { useRoomStore } from '@/stores/room'
 import { useSettingsStore } from '@/stores/settings'
 import { createDefaultRelayConfig } from '@/utils/relayConfig'
 import type { RoomPasscode } from '@/types'
+import PlaybackReadinessPanel from './PlaybackReadinessPanel.vue'
 import {
   Link, Upload, Copy, Check, AlertTriangle, Info, FileVideo, Globe, ShieldCheck, Wifi, ChevronDown, RotateCcw,
 } from 'lucide-vue-next'
@@ -99,6 +100,22 @@ const selectedShareAddress = computed(() =>
   room.passcodes.find(item => item.ip === room.preferredShareIp),
 )
 
+const sourceSummary = computed(() => {
+  if (room.videoState.sourceType === 'magnet') {
+    return room.magnetSelectedFileName || '磁力链接（正在解析或等待选择）'
+  }
+  return room.videoState.source
+})
+
+const sourceTypeLabel = computed(() => ({
+  url: '网络视频',
+  hls: 'HLS 视频流',
+  flv: 'FLV 视频流',
+  dash: 'DASH 视频流',
+  file: '本地视频',
+  magnet: '磁力视频',
+}[room.videoState.sourceType] || room.videoState.sourceType))
+
 function passcodeBadgeText(item: RoomPasscode) {
   if (item.isIPv6Public && item.isIPv6Temporary) return '临时 IPv6'
   if (item.isIPv6Public) return '公网 IPv6'
@@ -182,8 +199,8 @@ function resetRelaySettings() {
           <FileVideo :size="12" />
           当前视频
         </div>
-        <div class="text-fg-muted truncate font-mono">{{ room.videoState.source }}</div>
-        <div class="text-fg-subtle mt-0.5">类型: {{ room.videoState.sourceType }}</div>
+        <div class="text-fg-muted truncate" :class="room.videoState.sourceType === 'magnet' ? '' : 'font-mono'">{{ sourceSummary }}</div>
+        <div class="text-fg-subtle mt-0.5">来源: {{ sourceTypeLabel }}</div>
         <div v-if="room.videoState.chunkManifest" class="text-fg-subtle mt-0.5 truncate font-mono">
           分发清单: {{ room.videoState.chunkManifest }}
         </div>
@@ -462,6 +479,15 @@ function resetRelaySettings() {
           </button>
         </div>
       </div>
+
+      <PlaybackReadinessPanel
+        :readiness="room.playbackReadiness"
+        :is-host="room.isHost"
+        :auto-start-enabled="room.autoStartWhenReady"
+        @play-now="room.requestPlaybackNow"
+        @wait-for-members="room.waitForEveryoneThenPlay"
+        @cancel-auto-start="room.cancelAutoStartPlayback"
+      />
     </section>
   </div>
 </template>
